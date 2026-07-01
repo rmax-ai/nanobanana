@@ -18,17 +18,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
 import re
-import shutil
 import sys
-import tempfile
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -60,7 +56,16 @@ class ExitCode:
 
 
 SUPPORTED_ASPECT_RATIOS: tuple[str, ...] = (
-    "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9",
+    "1:1",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:3",
+    "4:5",
+    "5:4",
+    "9:16",
+    "16:9",
+    "21:9",
 )
 FLASH_ONLY_ASPECT_RATIOS: tuple[str, ...] = ("1:4", "4:1", "1:8", "8:1")
 SUPPORTED_SIZES: tuple[str, ...] = ("0.5K", "1K", "2K", "4K")
@@ -130,7 +135,7 @@ def vlog(**kwargs: object) -> None:
     print(json.dumps(entry, default=str), file=sys.stderr, flush=True)
 
 
-def fail(code: int, message: str) -> typer.Exit:
+def fail(code: int, message: str) -> NoReturn:
     """Print error to stderr and raise typed exit."""
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=code)
@@ -152,7 +157,9 @@ def resolve_api_key(api_key: str | None, config_path: Path | None = None) -> str
         cfg_key = config.get("api_key")
         if cfg_key:
             return cfg_key
-    fail(ExitCode.AUTH_FAILURE, "No API key found. Set GEMINI_API_KEY or pass --api-key.")
+    fail(
+        ExitCode.AUTH_FAILURE, "No API key found. Set GEMINI_API_KEY or pass --api-key."
+    )
 
 
 def load_config(config_path: Path | None = None) -> dict:
@@ -179,14 +186,16 @@ def main(
     model: Annotated[
         str,
         typer.Option(
-            "--model", "-m",
+            "--model",
+            "-m",
             help="Model alias: auto, lite, flash, pro, legacy",
         ),
     ] = "auto",
     output_dir: Annotated[
         Path | None,
         typer.Option(
-            "--output-dir", "-d",
+            "--output-dir",
+            "-d",
             help="Output directory for generated files",
             exists=False,
         ),
@@ -198,7 +207,8 @@ def main(
     config: Annotated[
         Path | None,
         typer.Option(
-            "--config", "-c",
+            "--config",
+            "-c",
             help="Path to config file (default: ~/.config/nanobanana/config.toml)",
             exists=True,
         ),
@@ -206,7 +216,8 @@ def main(
     fmt: Annotated[
         str,
         typer.Option(
-            "--format", "-f",
+            "--format",
+            "-f",
             help="Output image format",
         ),
     ] = "png",
@@ -224,7 +235,9 @@ def main(
     ] = False,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print what would happen without making API calls"),
+        typer.Option(
+            "--dry-run", help="Print what would happen without making API calls"
+        ),
     ] = False,
     overwrite: Annotated[
         bool,
@@ -313,20 +326,330 @@ ALIAS_TO_MODEL: dict[str, str] = {v["alias"]: k for k, v in CAPABILITIES.items()
 # Presets
 # =============================================================================
 
-PRESETS: dict[str, dict] = {}
+PRESETS: dict[str, dict[str, str]] = {
+    "architecture-diagram": {
+        "model": "pro",
+        "aspect": "16:9",
+        "size": "2K",
+        "thinking": "high",
+        "prompt_prefix": "Create a technically precise software architecture diagram...",
+    },
+    "icon": {
+        "model": "lite",
+        "aspect": "1:1",
+        "size": "1K",
+        "prompt_prefix": "Create a simple, clean icon...",
+    },
+    "photo": {"model": "flash", "aspect": "3:2", "size": "2K"},
+    "portrait": {"model": "flash", "aspect": "2:3", "size": "2K"},
+    "product": {"model": "pro", "aspect": "1:1", "size": "2K"},
+    "editorial": {"model": "pro", "aspect": "4:5", "size": "2K"},
+    "sticker": {"model": "lite", "aspect": "1:1", "size": "1K"},
+    "logo-concept": {"model": "pro", "aspect": "1:1", "size": "2K", "thinking": "high"},
+    "social-card": {"model": "flash", "aspect": "16:9", "size": "1K"},
+    "slide-hero": {"model": "pro", "aspect": "16:9", "size": "4K", "thinking": "high"},
+    "infographic": {"model": "pro", "aspect": "9:16", "size": "4K", "thinking": "high"},
+    "character-sheet": {"model": "flash", "aspect": "2:3", "size": "2K"},
+    "storyboard": {"model": "flash", "aspect": "16:9", "size": "2K"},
+    "texture": {"model": "lite", "aspect": "1:1", "size": "1K"},
+    "background": {"model": "flash", "aspect": "16:9", "size": "2K"},
+    "thumbnail": {"model": "lite", "aspect": "16:9", "size": "1K"},
+    "wireframe": {"model": "flash", "aspect": "16:9", "size": "1K"},
+}
 
 # =============================================================================
 # Cost Estimates
 # =============================================================================
 
-COST_TABLE: dict[str, dict[str, float]] = {}
-COST_RETRIEVAL_DATE: str = ""
+COST_TABLE: dict[str, dict[str, float]] = {
+    "gemini-3.1-flash-lite-image": {"1K": 0.0336},
+    "gemini-3.1-flash-image": {"0.5K": 0.045, "1K": 0.067, "2K": 0.101, "4K": 0.151},
+    "gemini-3-pro-image": {"1K": 0.067, "2K": 0.101, "4K": 0.151},
+    "gemini-2.5-flash-image": {"1K": 0.0336},
+}
+COST_RETRIEVAL_DATE: str = "2026-07-01"
 
 # =============================================================================
 # Utility Functions
 # =============================================================================
 
-# (utility functions will be added by subsequent phases)
+
+def resolve_model_alias(alias: str) -> str:
+    """Map CLI alias to full API model name."""
+    if alias == "auto":
+        return "auto"
+    if alias in CAPABILITIES:
+        return alias
+    if alias in ALIAS_TO_MODEL:
+        return ALIAS_TO_MODEL[alias]
+    fail(
+        ExitCode.INVALID_ARGS,
+        f"Unknown model '{alias}'. Use one of: auto, {', '.join(sorted(ALIAS_TO_MODEL))}.",
+    )
+
+
+def get_capability(model: str, key: str, default: Any = None) -> Any:
+    """Safely read a model capability."""
+    if model in CAPABILITIES:
+        resolved = model
+    else:
+        resolved = ALIAS_TO_MODEL.get(model, "")
+    return CAPABILITIES.get(resolved, {}).get(key, default)
+
+
+def supports(model: str, feature: str) -> bool:
+    """Return True when a capability is explicitly enabled."""
+    return bool(get_capability(model, feature, False))
+
+
+def _contains_explicit_text_request(prompt: str) -> bool:
+    """Heuristic for prompts asking for exact rendered text."""
+    return bool(
+        re.search(
+            r"\b(text|label|labels|caption|headline|title|word|words|spelled|exact)\b",
+            prompt.lower(),
+        ),
+    )
+
+
+def _should_use_lite(request: ImageRequest) -> bool:
+    """Return True when the request matches the low-cost Lite envelope."""
+    if request.image_size != "1K":
+        return False
+    if request.grounding:
+        return False
+    if len(request.references) > 1:
+        return False
+
+    command = request.command.lower()
+    if command == "generate":
+        return request.quality == "draft" and not request.text_output
+
+    lite_commands = {
+        "thumbnail",
+        "variation",
+        "variations",
+        "background_adjustment",
+        "sticker",
+        "draft",
+        "batch_preview",
+    }
+    return command in lite_commands
+
+
+def _should_use_pro(request: ImageRequest) -> bool:
+    """Return True when quality or complexity warrants Pro."""
+    if request.quality == "professional":
+        return True
+    if request.command.lower() in {"diagram", "infographic", "product", "layout"}:
+        return True
+    return len(request.prompt) > 100 and _contains_explicit_text_request(request.prompt)
+
+
+def select_model(request: ImageRequest) -> ModelDecision:
+    """Resolve auto policy to a concrete API model."""
+    if request.model != "auto":
+        resolved = resolve_model_alias(request.model)
+        return ModelDecision(
+            requested=request.model,
+            resolved=resolved,
+            selection_reason="explicitly requested model",
+        )
+
+    if _should_use_lite(request):
+        return ModelDecision(
+            requested="auto",
+            resolved="gemini-3.1-flash-lite-image",
+            selection_reason="matched low-cost Lite policy envelope",
+        )
+
+    if _should_use_pro(request):
+        return ModelDecision(
+            requested="auto",
+            resolved="gemini-3-pro-image",
+            selection_reason="matched high-fidelity Pro policy envelope",
+        )
+
+    return ModelDecision(
+        requested="auto",
+        resolved="gemini-3.1-flash-image",
+        selection_reason="default general-purpose model",
+    )
+
+
+def validate_request(request: ImageRequest, allow_degraded: bool = False) -> None:
+    """Validate request against model capabilities before API calls."""
+    if request.model == "auto":
+        resolved_model = select_model(request).resolved
+    else:
+        resolved_model = resolve_model_alias(request.model)
+    caps = CAPABILITIES.get(resolved_model)
+    if not caps:
+        fail(
+            ExitCode.CAPABILITY_MISMATCH,
+            f"Model '{resolved_model}' is not registered in capabilities.",
+        )
+    assert caps is not None
+
+    issues: list[str] = []
+
+    if request.image_size:
+        supported_sizes = caps.get("supported_sizes", ())
+        if request.image_size not in supported_sizes:
+            issues.append(
+                f"size '{request.image_size}' is unsupported for model '{caps['alias']}' "
+                f"(supported: {', '.join(supported_sizes)})",
+            )
+
+    if request.aspect_ratio:
+        all_ratios = set(SUPPORTED_ASPECT_RATIOS) | set(FLASH_ONLY_ASPECT_RATIOS)
+        if request.aspect_ratio not in all_ratios:
+            issues.append(
+                f"aspect ratio '{request.aspect_ratio}' is invalid "
+                f"(supported: {', '.join(sorted(all_ratios))})",
+            )
+        elif (
+            request.aspect_ratio in FLASH_ONLY_ASPECT_RATIOS
+            and resolved_model != ALIAS_TO_MODEL["flash"]
+        ):
+            issues.append(
+                f"aspect ratio '{request.aspect_ratio}' is Flash-only, use model 'flash' or change aspect ratio",
+            )
+
+    if request.grounding and not supports(resolved_model, "grounding"):
+        issues.append(f"grounding is unsupported for model '{caps['alias']}'")
+
+    if request.thinking_level and request.thinking_level != "auto":
+        allowed_thinking = tuple(caps.get("thinking_levels", ()))
+        if not allowed_thinking:
+            issues.append(
+                f"thinking controls are unavailable for model '{caps['alias']}', remove --thinking",
+            )
+        elif request.thinking_level not in allowed_thinking:
+            issues.append(
+                f"thinking level '{request.thinking_level}' is unsupported for model '{caps['alias']}' "
+                f"(supported: {', '.join(allowed_thinking)})",
+            )
+
+    max_refs = int(caps.get("max_references", 0))
+    if len(request.references) > max_refs:
+        issues.append(
+            f"{len(request.references)} references exceed model '{caps['alias']}' limit of {max_refs}",
+        )
+
+    if issues and not allow_degraded:
+        fail(
+            ExitCode.CAPABILITY_MISMATCH,
+            "Capability mismatch: " + "; ".join(issues),
+        )
+
+
+def estimate_cost(model: str, size: str, count: int = 1) -> float | None:
+    """Estimate total request cost in USD from the static table."""
+    resolved_model = resolve_model_alias(model)
+    if resolved_model == "auto":
+        return None
+    unit_cost = COST_TABLE.get(resolved_model, {}).get(size)
+    if unit_cost is None:
+        return None
+    return unit_cost * max(count, 0)
+
+
+def detect_mime_type(path: Path) -> str:
+    """Detect image MIME type from magic bytes."""
+    if not path.exists():
+        fail(ExitCode.INPUT_FAILURE, f"Input file not found: {path}")
+    header = path.read_bytes()[:8]
+    if header.startswith(b"\x89PNG"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    fail(
+        ExitCode.INPUT_FAILURE,
+        f"Unsupported image format for '{path}'. Expected PNG or JPEG magic bytes.",
+    )
+
+
+def slugify(text: str, max_len: int = 64) -> str:
+    """Create a short, safe filename slug from roughly the first three words."""
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    slug = "-".join(words[:3]) if words else "image"
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    slug = slug[:max_len].strip("-")
+    return slug or "image"
+
+
+def sha256_file(path: Path) -> str:
+    """Compute SHA-256 digest for a file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_bytes(data: bytes) -> str:
+    """Compute SHA-256 digest for bytes."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def expand_preset(name: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Load a preset and merge non-None override values."""
+    preset = PRESETS.get(name)
+    if preset is None:
+        available = ", ".join(sorted(PRESETS))
+        fail(
+            ExitCode.INVALID_ARGS,
+            f"Unknown preset '{name}'. Available presets: {available}",
+        )
+
+    expanded = dict(preset)
+    if overrides:
+        for key, value in overrides.items():
+            if value is not None:
+                expanded[key] = value
+    return expanded
+
+
+def load_reference(path: Path, role: str) -> ReferenceImage:
+    """Load one local reference image and compute reproducibility metadata."""
+    if not path.exists():
+        fail(ExitCode.INPUT_FAILURE, f"Reference file not found: {path}")
+    if not path.is_file():
+        fail(ExitCode.INPUT_FAILURE, f"Reference path is not a file: {path}")
+    return ReferenceImage(
+        path=path,
+        role=role,
+        mime_type=detect_mime_type(path),
+        sha256=sha256_file(path),
+    )
+
+
+def load_references(**kwargs: Any) -> tuple[ReferenceImage, ...]:
+    """Convert compose command reference flags into typed reference images."""
+    references: list[ReferenceImage] = []
+
+    ordered_roles = (
+        ("subject", "subject"),
+        ("object_ref", "object"),
+        ("object", "object"),
+        ("character", "character"),
+        ("style", "style"),
+        ("background", "background"),
+    )
+    for key, role in ordered_roles:
+        value = kwargs.get(key)
+        if isinstance(value, Path):
+            references.append(load_reference(value, role=role))
+
+    generic = kwargs.get("reference")
+    if isinstance(generic, list):
+        for item in generic:
+            if isinstance(item, Path):
+                references.append(load_reference(item, role="reference"))
+
+    return tuple(references)
+
 
 # =============================================================================
 # Command Stubs
@@ -337,20 +660,47 @@ COST_RETRIEVAL_DATE: str = ""
 def generate(
     ctx: typer.Context,
     prompt: Annotated[str, typer.Argument(help="Text prompt for image generation")],
-    prompt_file: Annotated[Path | None, typer.Option("--prompt-file", help="Read prompt from file")] = None,
-    negative: Annotated[str | None, typer.Option("--negative", help="Negative prompt constraints")] = None,
+    prompt_file: Annotated[
+        Path | None, typer.Option("--prompt-file", help="Read prompt from file")
+    ] = None,
+    negative: Annotated[
+        str | None, typer.Option("--negative", help="Negative prompt constraints")
+    ] = None,
     aspect: Annotated[str, typer.Option("--aspect", "-a", help="Aspect ratio")] = "1:1",
-    size: Annotated[str, typer.Option("--size", "-s", help="Output resolution: 0.5K, 1K, 2K, 4K")] = "1K",
-    quality: Annotated[str, typer.Option("--quality", help="Quality tier: draft, balanced, professional")] = "balanced",
-    thinking: Annotated[str, typer.Option("--thinking", help="Thinking level: minimal, high, auto")] = "auto",
-    count: Annotated[int, typer.Option("--count", "-n", help="Number of images to generate")] = 1,
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file path")] = None,
-    text_output: Annotated[bool, typer.Option("--text-output", help="Include text in response")] = False,
-    ground: Annotated[bool, typer.Option("--ground", help="Enable web search grounding")] = False,
-    retry_with_pro: Annotated[bool, typer.Option("--retry-with-pro", help="Escalate to Pro on Flash failure")] = False,
-    preset: Annotated[str | None, typer.Option("--preset", "-p", help="Apply named preset")] = None,
-    max_estimated_cost: Annotated[float | None, typer.Option("--max-estimated-cost", help="Cost ceiling in USD")] = None,
-    show_estimate: Annotated[bool, typer.Option("--show-estimate", help="Print cost estimate and exit")] = False,
+    size: Annotated[
+        str, typer.Option("--size", "-s", help="Output resolution: 0.5K, 1K, 2K, 4K")
+    ] = "1K",
+    quality: Annotated[
+        str,
+        typer.Option("--quality", help="Quality tier: draft, balanced, professional"),
+    ] = "balanced",
+    thinking: Annotated[
+        str, typer.Option("--thinking", help="Thinking level: minimal, high, auto")
+    ] = "auto",
+    count: Annotated[
+        int, typer.Option("--count", "-n", help="Number of images to generate")
+    ] = 1,
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Output file path")
+    ] = None,
+    text_output: Annotated[
+        bool, typer.Option("--text-output", help="Include text in response")
+    ] = False,
+    ground: Annotated[
+        bool, typer.Option("--ground", help="Enable web search grounding")
+    ] = False,
+    retry_with_pro: Annotated[
+        bool, typer.Option("--retry-with-pro", help="Escalate to Pro on Flash failure")
+    ] = False,
+    preset: Annotated[
+        str | None, typer.Option("--preset", "-p", help="Apply named preset")
+    ] = None,
+    max_estimated_cost: Annotated[
+        float | None, typer.Option("--max-estimated-cost", help="Cost ceiling in USD")
+    ] = None,
+    show_estimate: Annotated[
+        bool, typer.Option("--show-estimate", help="Print cost estimate and exit")
+    ] = False,
 ) -> None:
     """Generate an image from a text prompt."""
     # TODO: Implement
@@ -362,14 +712,29 @@ def edit(
     ctx: typer.Context,
     input_image: Annotated[Path, typer.Argument(help="Input image to edit")],
     instruction: Annotated[str, typer.Argument(help="Editing instruction")],
-    instruction_file: Annotated[Path | None, typer.Option("--instruction-file", help="Read instruction from file")] = None,
-    preserve: Annotated[str | None, typer.Option("--preserve", help="Elements to preserve")] = None,
-    change: Annotated[str | None, typer.Option("--change", help="Elements to change")] = None,
-    mask: Annotated[str | None, typer.Option("--mask", help="Mask type: semantic, none, or path to mask image")] = None,
+    instruction_file: Annotated[
+        Path | None,
+        typer.Option("--instruction-file", help="Read instruction from file"),
+    ] = None,
+    preserve: Annotated[
+        str | None, typer.Option("--preserve", help="Elements to preserve")
+    ] = None,
+    change: Annotated[
+        str | None, typer.Option("--change", help="Elements to change")
+    ] = None,
+    mask: Annotated[
+        str | None,
+        typer.Option("--mask", help="Mask type: semantic, none, or path to mask image"),
+    ] = None,
     aspect: Annotated[str, typer.Option("--aspect", "-a", help="Aspect ratio")] = "1:1",
     size: Annotated[str, typer.Option("--size", "-s", help="Output resolution")] = "1K",
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file path")] = None,
-    strict_preservation: Annotated[bool, typer.Option("--strict-preservation", help="Stronger preservation constraints")] = False,
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Output file path")
+    ] = None,
+    strict_preservation: Annotated[
+        bool,
+        typer.Option("--strict-preservation", help="Stronger preservation constraints"),
+    ] = False,
 ) -> None:
     """Modify an existing image while preserving selected elements."""
     fail(ExitCode.INTERNAL, "edit: not yet implemented")
@@ -379,16 +744,37 @@ def edit(
 def compose(
     ctx: typer.Context,
     instruction: Annotated[str, typer.Argument(help="Composition instruction")],
-    subject: Annotated[Path | None, typer.Option("--subject", help="Primary subject image")] = None,
-    object_ref: Annotated[Path | None, typer.Option("--object", help="Object reference image")] = None,
-    character: Annotated[Path | None, typer.Option("--character", help="Character reference image")] = None,
-    style: Annotated[Path | None, typer.Option("--style", help="Style reference image")] = None,
-    background: Annotated[Path | None, typer.Option("--background", help="Background reference image")] = None,
-    reference: Annotated[list[Path] | None, typer.Option("--reference", help="Generic reference image (repeatable)")] = None,
+    subject: Annotated[
+        Path | None, typer.Option("--subject", help="Primary subject image")
+    ] = None,
+    object_ref: Annotated[
+        Path | None, typer.Option("--object", help="Object reference image")
+    ] = None,
+    character: Annotated[
+        Path | None, typer.Option("--character", help="Character reference image")
+    ] = None,
+    style: Annotated[
+        Path | None, typer.Option("--style", help="Style reference image")
+    ] = None,
+    background: Annotated[
+        Path | None, typer.Option("--background", help="Background reference image")
+    ] = None,
+    reference: Annotated[
+        list[Path] | None,
+        typer.Option("--reference", help="Generic reference image (repeatable)"),
+    ] = None,
     aspect: Annotated[str, typer.Option("--aspect", "-a", help="Aspect ratio")] = "1:1",
     size: Annotated[str, typer.Option("--size", "-s", help="Output resolution")] = "1K",
-    output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file path")] = None,
-    allow_degraded: Annotated[bool, typer.Option("--allow-degraded", help="Allow degraded quality for unsupported combinations")] = False,
+    output: Annotated[
+        Path | None, typer.Option("--output", "-o", help="Output file path")
+    ] = None,
+    allow_degraded: Annotated[
+        bool,
+        typer.Option(
+            "--allow-degraded",
+            help="Allow degraded quality for unsupported combinations",
+        ),
+    ] = False,
 ) -> None:
     """Combine multiple reference images into a coherent output."""
     fail(ExitCode.INTERNAL, "compose: not yet implemented")
@@ -398,11 +784,22 @@ def compose(
 def diagram(
     ctx: typer.Context,
     prompt: Annotated[str, typer.Argument(help="Diagram description")],
-    type_: Annotated[str, typer.Option("--type", help="Diagram type: architecture, sequence, flowchart, etc.")] = "architecture",
-    labels_file: Annotated[Path | None, typer.Option("--labels-file", help="File with terminology")] = None,
+    type_: Annotated[
+        str,
+        typer.Option(
+            "--type", help="Diagram type: architecture, sequence, flowchart, etc."
+        ),
+    ] = "architecture",
+    labels_file: Annotated[
+        Path | None, typer.Option("--labels-file", help="File with terminology")
+    ] = None,
     size: Annotated[str, typer.Option("--size", "-s", help="Output resolution")] = "2K",
-    text_plan: Annotated[str, typer.Option("--text-plan", help="Two-phase text planning: auto, on, off")] = "auto",
-    validate_text: Annotated[bool, typer.Option("--validate-text", help="OCR-free text validation")] = False,
+    text_plan: Annotated[
+        str, typer.Option("--text-plan", help="Two-phase text planning: auto, on, off")
+    ] = "auto",
+    validate_text: Annotated[
+        bool, typer.Option("--validate-text", help="OCR-free text validation")
+    ] = False,
 ) -> None:
     """Produce diagrams, infographics, or explanatory visuals."""
     fail(ExitCode.INTERNAL, "diagram: not yet implemented")
@@ -412,16 +809,37 @@ def diagram(
 def product(
     ctx: typer.Context,
     prompt: Annotated[str, typer.Argument(help="Product shot description")],
-    subject: Annotated[Path | None, typer.Option("--subject", help="Subject image")] = None,
+    subject: Annotated[
+        Path | None, typer.Option("--subject", help="Subject image")
+    ] = None,
     logo: Annotated[Path | None, typer.Option("--logo", help="Logo image")] = None,
-    packaging: Annotated[Path | None, typer.Option("--packaging", help="Packaging reference")] = None,
-    bg: Annotated[Path | None, typer.Option("--background", help="Background image")] = None,
-    view: Annotated[str | None, typer.Option("--view", help="Camera view angle")] = None,
-    lighting: Annotated[str | None, typer.Option("--lighting", help="Lighting style")] = None,
-    surface: Annotated[str | None, typer.Option("--surface", help="Surface material")] = None,
-    brand_colors: Annotated[str | None, typer.Option("--brand-colors", help="Brand color palette")] = None,
-    copy_text: Annotated[str | None, typer.Option("--copy", help="Copy text overlay")] = None,
-    preserve_geometry: Annotated[bool, typer.Option("--preserve-geometry", help="Preserve exact proportions and controls")] = False,
+    packaging: Annotated[
+        Path | None, typer.Option("--packaging", help="Packaging reference")
+    ] = None,
+    bg: Annotated[
+        Path | None, typer.Option("--background", help="Background image")
+    ] = None,
+    view: Annotated[
+        str | None, typer.Option("--view", help="Camera view angle")
+    ] = None,
+    lighting: Annotated[
+        str | None, typer.Option("--lighting", help="Lighting style")
+    ] = None,
+    surface: Annotated[
+        str | None, typer.Option("--surface", help="Surface material")
+    ] = None,
+    brand_colors: Annotated[
+        str | None, typer.Option("--brand-colors", help="Brand color palette")
+    ] = None,
+    copy_text: Annotated[
+        str | None, typer.Option("--copy", help="Copy text overlay")
+    ] = None,
+    preserve_geometry: Annotated[
+        bool,
+        typer.Option(
+            "--preserve-geometry", help="Preserve exact proportions and controls"
+        ),
+    ] = False,
 ) -> None:
     """Create product shots and mockups."""
     fail(ExitCode.INTERNAL, "product: not yet implemented")
@@ -431,11 +849,21 @@ def product(
 def grounded(
     ctx: typer.Context,
     prompt: Annotated[str, typer.Argument(help="Grounded generation prompt")],
-    aspect: Annotated[str, typer.Option("--aspect", "-a", help="Aspect ratio")] = "16:9",
-    search: Annotated[str, typer.Option("--search", help="Search type: web, web-and-images")] = "web",
-    citations: Annotated[Path | None, typer.Option("--citations", help="Path for citation output")] = None,
-    show_sources: Annotated[bool, typer.Option("--show-sources", help="Display source attribution")] = False,
-    freshness: Annotated[str | None, typer.Option("--freshness", help="Search freshness constraint")] = None,
+    aspect: Annotated[
+        str, typer.Option("--aspect", "-a", help="Aspect ratio")
+    ] = "16:9",
+    search: Annotated[
+        str, typer.Option("--search", help="Search type: web, web-and-images")
+    ] = "web",
+    citations: Annotated[
+        Path | None, typer.Option("--citations", help="Path for citation output")
+    ] = None,
+    show_sources: Annotated[
+        bool, typer.Option("--show-sources", help="Display source attribution")
+    ] = False,
+    freshness: Annotated[
+        str | None, typer.Option("--freshness", help="Search freshness constraint")
+    ] = None,
 ) -> None:
     """Generate a visual using current web information."""
     fail(ExitCode.INTERNAL, "grounded: not yet implemented")
@@ -444,15 +872,34 @@ def grounded(
 @app.command()
 def variations(
     ctx: typer.Context,
-    source: Annotated[Path | None, typer.Argument(help="Source image for variations")] = None,
-    prompt: Annotated[str | None, typer.Argument(help="Variation prompt (if no source image)")] = None,
-    instruction: Annotated[str | None, typer.Option("--instruction", help="Variation direction")] = None,
-    count: Annotated[int, typer.Option("--count", "-n", help="Number of variations")] = 4,
-    parallel: Annotated[int, typer.Option("--parallel", help="Parallel generations")] = 1,
-    naming_template: Annotated[str | None, typer.Option("--naming-template", help="Filename template")] = None,
-    contact_sheet: Annotated[bool, typer.Option("--contact-sheet", help="Generate contact sheet")] = False,
-    select_best: Annotated[bool, typer.Option("--select-best", help="Select best via multimodal evaluation")] = False,
-    judge_model: Annotated[str | None, typer.Option("--judge-model", help="Model for best-selection")] = None,
+    source: Annotated[
+        Path | None, typer.Argument(help="Source image for variations")
+    ] = None,
+    prompt: Annotated[
+        str | None, typer.Argument(help="Variation prompt (if no source image)")
+    ] = None,
+    instruction: Annotated[
+        str | None, typer.Option("--instruction", help="Variation direction")
+    ] = None,
+    count: Annotated[
+        int, typer.Option("--count", "-n", help="Number of variations")
+    ] = 4,
+    parallel: Annotated[
+        int, typer.Option("--parallel", help="Parallel generations")
+    ] = 1,
+    naming_template: Annotated[
+        str | None, typer.Option("--naming-template", help="Filename template")
+    ] = None,
+    contact_sheet: Annotated[
+        bool, typer.Option("--contact-sheet", help="Generate contact sheet")
+    ] = False,
+    select_best: Annotated[
+        bool,
+        typer.Option("--select-best", help="Select best via multimodal evaluation"),
+    ] = False,
+    judge_model: Annotated[
+        str | None, typer.Option("--judge-model", help="Model for best-selection")
+    ] = None,
 ) -> None:
     """Produce prompt or image variations."""
     fail(ExitCode.INTERNAL, "variations: not yet implemented")
@@ -463,13 +910,28 @@ def batch(
     ctx: typer.Context,
     jobs_file: Annotated[Path, typer.Argument(help="JSONL file with batch jobs")],
     parallel: Annotated[int, typer.Option("--parallel", help="Max parallel jobs")] = 1,
-    continue_on_error: Annotated[bool, typer.Option("--continue-on-error", help="Continue after individual job failures")] = False,
-    fail_fast: Annotated[bool, typer.Option("--fail-fast", help="Stop on first failure")] = False,
-    resume: Annotated[bool, typer.Option("--resume", help="Resume incomplete batch")] = False,
+    continue_on_error: Annotated[
+        bool,
+        typer.Option(
+            "--continue-on-error", help="Continue after individual job failures"
+        ),
+    ] = False,
+    fail_fast: Annotated[
+        bool, typer.Option("--fail-fast", help="Stop on first failure")
+    ] = False,
+    resume: Annotated[
+        bool, typer.Option("--resume", help="Resume incomplete batch")
+    ] = False,
     retry: Annotated[int, typer.Option("--retry", help="Max retries per job")] = 3,
-    retry_backoff: Annotated[float, typer.Option("--retry-backoff", help="Backoff factor in seconds")] = 2.0,
-    model_budget: Annotated[str | None, typer.Option("--model-budget", help="Model budget constraints")] = None,
-    max_estimated_cost: Annotated[float | None, typer.Option("--max-estimated-cost", help="Max total cost in USD")] = None,
+    retry_backoff: Annotated[
+        float, typer.Option("--retry-backoff", help="Backoff factor in seconds")
+    ] = 2.0,
+    model_budget: Annotated[
+        str | None, typer.Option("--model-budget", help="Model budget constraints")
+    ] = None,
+    max_estimated_cost: Annotated[
+        float | None, typer.Option("--max-estimated-cost", help="Max total cost in USD")
+    ] = None,
 ) -> None:
     """Execute jobs from JSONL."""
     fail(ExitCode.INTERNAL, "batch: not yet implemented")
@@ -511,7 +973,9 @@ def models(ctx: typer.Context) -> None:
 @app.command()
 def config_cmd(
     ctx: typer.Context,
-    show: Annotated[bool, typer.Option("--show", help="Show current configuration")] = False,
+    show: Annotated[
+        bool, typer.Option("--show", help="Show current configuration")
+    ] = False,
 ) -> None:
     """Read or update non-secret defaults."""
     if show:
