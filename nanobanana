@@ -15,16 +15,19 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
+import random
 import re
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, Callable, NoReturn, cast
 
 import typer
 from rich.console import Console
@@ -649,6 +652,298 @@ def load_references(**kwargs: Any) -> tuple[ReferenceImage, ...]:
                 references.append(load_reference(item, role="reference"))
 
     return tuple(references)
+
+
+def _get(obj: object, key: str, default: Any = None) -> Any:
+    """Get a value from a dict or object by attribute/key name."""
+    if isinstance(obj, dict):
+        mapping = cast(dict[str, Any], obj)
+        return mapping.get(key, default)
+    return getattr(obj, key, default)
+
+
+# =============================================================================
+# Prompt Assembly
+# =============================================================================
+
+
+def build_normalized_prompt(
+    request: ImageRequest,
+    negative: str | None = None,
+    preset: dict | None = None,
+) -> str:
+    """Build a structured, auditable prompt from the request and constraints."""
+    sections: list[tuple[str, str]] = []
+    prefix = (preset or {}).get("prompt_prefix", "").strip()
+    user_prompt = request.prompt.strip()
+
+    if prefix:
+        sections.append(("TASK", prefix))
+        sections.append(("CONTEXT", user_prompt))
+    else:
+        sections.append(("TASK", user_prompt))
+
+    requirements: list[str] = []
+    if request.aspect_ratio:
+        requirements.append(f"Aspect ratio: {request.aspect_ratio}")
+    if request.image_size:
+        requirements.append(f"Image size: {request.image_size}")
+    if request.quality:
+        requirements.append(f"Quality: {request.quality}")
+    if request.thinking_level and request.thinking_level != "auto":
+        requirements.append(f"Thinking level: {request.thinking_level}")
+    if request.grounding:
+        requirements.append("Grounded with web search")
+    if request.text_output:
+        requirements.append("Include text output / reasoning")
+    if request.count > 1:
+        requirements.append(f"Generate {request.count} images")
+    if request.mime_type:
+        requirements.append(f"Output format: {request.mime_type}")
+    if requirements:
+        sections.append(
+            ("REQUIREMENTS", "\n".join(f"- {item}" for item in requirements))
+        )
+
+    if request.references:
+        sections.append(("REFERENCE ROLES", annotate_references(request.references)))
+
+    if request.command in {"edit", "iterate", "compose"}:
+        preserve_msg = (
+            "Preserve original subject identity, structure, and any explicitly "
+            "requested elements unless the task requires changing them."
+        )
+        sections.append(("PRESERVE", preserve_msg))
+
+    avoid_parts: list[str] = []
+    negative_bullets = expand_negative(negative) if negative else ""
+    if negative_bullets:
+        avoid_parts.append(negative_bullets)
+    avoid_parts.extend(
+        [
+            "- Illegible labels or text",
+            "- Generic or off-brand visual clichés",
+        ]
+    )
+    sections.append(("AVOID", "\n".join(avoid_parts)))
+
+    output_intent = "Produce a single, self-contained image that fulfills the task and requirements."
+    if request.text_output:
+        output_intent += " Include a brief text explanation alongside the image."
+    sections.append(("OUTPUT INTENT", output_intent))
+
+    return "\n\n".join(f"{label}:\n{content}" for label, content in sections)
+
+
+def expand_negative(negative: str) -> str:
+    """Split negative prompt on commas/semicolons and format as bullet points."""
+    if not negative:
+        return ""
+    parts = re.split(r"[,;]+", negative)
+    items = [p.strip() for p in parts if p.strip()]
+    return "\n".join(f"- {item}" for item in items)
+
+
+def annotate_references(references: tuple[ReferenceImage, ...]) -> str:
+    """Return per-role instructions for each reference image."""
+    if not references:
+        return ""
+    lines = []
+    for idx, ref in enumerate(references, 1):
+        lines.append(
+            f"Reference {idx} ({ref.role}): use this image as the {ref.role} reference."
+        )
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Request Construction
+# =============================================================================
+
+
+def build_interaction_input(
+    request: ImageRequest,
+    normalized_prompt: str,
+    decision: ModelDecision,
+) -> dict:
+    """Build kwargs for client.interactions.create."""
+    input_data: dict[str, Any] = {
+        "model": decision.resolved,
+        "contents": [{"role": "user", "parts": [{"text": normalized_prompt}]}],
+    }
+
+    if request.references:
+        parts: list[dict[str, Any]] = [{"text": normalized_prompt}]
+        for ref in request.references:
+            image_bytes = ref.path.read_bytes()
+            b64 = base64.b64encode(image_bytes).decode("ascii")
+            parts.append({"inline_data": {"mime_type": ref.mime_type, "data": b64}})
+        input_data["contents"] = [{"role": "user", "parts": parts}]
+
+    if request.text_output:
+        input_data["response_format"] = [
+            {"type": "text"},
+            {"type": request.mime_type},
+        ]
+    else:
+        input_data["response_format"] = {"type": request.mime_type}
+
+    if request.grounding:
+        input_data["tools"] = [{"type": "google_search"}]
+
+    generation_config: dict[str, Any] = {}
+    if request.thinking_level and request.thinking_level != "auto":
+        generation_config["thinking_level"] = request.thinking_level
+    if request.seed:
+        try:
+            generation_config["seed"] = int(request.seed)
+        except ValueError:
+            generation_config["seed"] = request.seed
+    if generation_config:
+        input_data["generation_config"] = generation_config
+
+    return input_data
+
+
+# =============================================================================
+# Retry Handler
+# =============================================================================
+
+
+def with_retry(
+    fn: Callable[[], Any],
+    max_attempts: int = 3,
+    max_delay: float = 30.0,
+) -> Any:
+    """Run fn with exponential backoff and jitter, retrying transient errors."""
+    delay = 1.0
+    last_exception: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exception = exc
+            if not is_retryable(exc):
+                raise
+            if attempt == max_attempts:
+                break
+            vlog(
+                attempt=attempt,
+                max_attempts=max_attempts,
+                retry_delay=round(delay, 2),
+                error=type(exc).__name__,
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, max_delay) * random.uniform(0.8, 1.2)
+    if last_exception is not None:
+        raise last_exception
+    raise RuntimeError("Retry exhausted without exception")
+
+
+def is_retryable(exc: Exception) -> bool:
+    """Return True for retryable network/server errors; False for client errors."""
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code is not None:
+        code_str = str(code)
+        return code_str == "429" or code_str.startswith("5")
+    message = str(exc).lower()
+    return (
+        "429" in message
+        or "rate limit" in message
+        or "timeout" in message
+        or "connection" in message
+    )
+
+
+def is_safety_refusal(response: object) -> bool:
+    """Check finish_reason and prompt feedback for safety blocks."""
+    if response is None:
+        return False
+    candidates = _get(response, "candidates", []) or []
+    for candidate in candidates:
+        finish = _get(candidate, "finish_reason")
+        if finish is not None and str(finish).upper() in {"SAFETY", "BLOCKED"}:
+            return True
+    prompt_feedback = _get(response, "prompt_feedback")
+    if prompt_feedback is not None:
+        block = _get(prompt_feedback, "block_reason", "")
+        if block and "safety" in str(block).lower():
+            return True
+    return False
+
+
+# =============================================================================
+# Response Extraction
+# =============================================================================
+
+
+def execute_request(client, input_data: dict) -> object:
+    """Call client.interactions.create with retry."""
+    return with_retry(lambda: client.interactions.create(**input_data))
+
+
+def extract_images(response: object) -> list[bytes]:
+    """Decode base64 inline_data from response candidates."""
+    images: list[bytes] = []
+    candidates = _get(response, "candidates", []) or []
+    for candidate in candidates:
+        content = _get(candidate, "content")
+        if content is None:
+            continue
+        parts = _get(content, "parts", []) or []
+        for part in parts:
+            if isinstance(part, dict):
+                inline_data = part.get("inline_data")
+                if isinstance(inline_data, dict) and inline_data.get("data"):
+                    images.append(base64.b64decode(inline_data["data"]))
+            else:
+                inline_data = _get(part, "inline_data")
+                if inline_data is not None:
+                    data = _get(inline_data, "data")
+                    if data:
+                        images.append(base64.b64decode(data))
+    return images
+
+
+def extract_grounding_metadata(response: object) -> dict | None:
+    """Extract grounding sources, citations, and suggestions."""
+    metadata: dict[str, list[Any]] = {
+        "sources": [],
+        "citations": [],
+        "search_suggestions": [],
+    }
+    candidates = _get(response, "candidates", []) or []
+    for candidate in candidates:
+        grounding = _get(candidate, "grounding_metadata")
+        if grounding is None:
+            continue
+        sources = _get(grounding, "sources", _get(grounding, "grounding_chunks", []))
+        citations = _get(
+            grounding, "citations", _get(grounding, "grounding_supports", [])
+        )
+        suggestions = _get(
+            grounding, "suggestions", _get(grounding, "search_entry_point", [])
+        )
+        metadata["sources"].extend(list(sources))
+        metadata["citations"].extend(list(citations))
+        metadata["search_suggestions"].extend(list(suggestions))
+    if any(metadata.values()):
+        return metadata
+    return None
+
+
+def classify_response_error(response: object) -> int | None:
+    """Classify a response as a safety refusal, empty response, or valid."""
+    if response is None:
+        return ExitCode.EMPTY_RESPONSE
+    if is_safety_refusal(response):
+        return ExitCode.SAFETY_REFUSAL
+    images = extract_images(response)
+    if images and any(images):
+        return None
+    return ExitCode.EMPTY_RESPONSE
 
 
 # =============================================================================
