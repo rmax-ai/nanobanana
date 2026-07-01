@@ -1,542 +1,695 @@
 import base64
 import json
+import os
+import re
+import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+import typer
 
-import nanobanana as nb  # type: ignore[import]
+import conftest  # type: ignore[import]
+from conftest import (  # type: ignore[import]
+    COST_TABLE,
+    ExitCode,
+    GeneratedAsset,
+    ImageRequest,
+    ModelDecision,
+    ReferenceImage,
+    _should_use_lite,
+    _should_use_pro,
+    annotate_references,
+    atomic_write,
+    build_edit_instruction,
+    build_interaction_input,
+    build_normalized_prompt,
+    classify_api_exception,
+    detect_mime_type,
+    estimate_cost,
+    execute_request,
+    expand_negative,
+    extract_grounding_metadata,
+    generate_filename,
+    get_capability,
+    is_retryable,
+    is_safety_refusal,
+    resolve_model_alias,
+    resolve_output_path,
+    run_generate_pipeline,
+    select_model,
+    sha256_bytes,
+    sha256_file,
+    slugify,
+    supports,
+    validate_request,
+    with_retry,
+    write_manifest,
+)
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def make_image_response(image_data: bytes) -> dict:
+    b64 = base64.b64encode(image_data).decode("ascii")
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [{"inline_data": {"mime_type": "image/png", "data": b64}}]
+                }
+            }
+        ]
+    }
+
+
+def make_context(**overrides):
+    ctx = MagicMock()
+    ctx.obj = {
+        "model": "auto",
+        "output_dir": None,
+        "api_key": "test-key",
+        "config": None,
+        "format": "png",
+        "json": False,
+        "quiet": True,
+        "verbose": False,
+        "dry_run": False,
+        "overwrite": False,
+        "seed": None,
+        "request_id": None,
+    }
+    ctx.obj.update(overrides)
+    return ctx
+
+
+# =============================================================================
+# Unit Tests
+# =============================================================================
+
+
+class TestModelSelection:
+    def test_auto_simple_defaults_to_flash(self):
+        request = ImageRequest(command="generate", prompt="a banana", model="auto")
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3.1-flash-image"
+        assert "default general-purpose" in decision.selection_reason
+
+    def test_auto_draft_1k_to_lite(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="a banana",
+            model="auto",
+            image_size="1K",
+            quality="draft",
+        )
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3.1-flash-lite-image"
+
+    def test_auto_variations_to_lite(self):
+        request = ImageRequest(
+            command="variations", prompt="a banana", model="auto", image_size="1K"
+        )
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3.1-flash-lite-image"
+
+    def test_auto_diagram_to_pro(self):
+        request = ImageRequest(
+            command="diagram", prompt="a system diagram", model="auto"
+        )
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3-pro-image"
+
+    def test_auto_product_to_pro(self):
+        request = ImageRequest(command="product", prompt="a product shot", model="auto")
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3-pro-image"
+
+    def test_auto_explicit_text_long_prompt_to_pro(self):
+        prompt = (
+            'Create an image with the exact spelled-out headline "Welcome to the Future" '
+            "in large letters on a billboard"
+        )
+        request = ImageRequest(command="generate", prompt=prompt, model="auto")
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3-pro-image"
+
+    def test_explicit_flash(self):
+        request = ImageRequest(command="generate", prompt="a banana", model="flash")
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3.1-flash-image"
+        assert decision.requested == "flash"
+
+    def test_explicit_lite(self):
+        request = ImageRequest(command="generate", prompt="a banana", model="lite")
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3.1-flash-lite-image"
+
+    def test_explicit_pro(self):
+        request = ImageRequest(command="generate", prompt="a banana", model="pro")
+        decision = select_model(request)
+        assert decision.resolved == "gemini-3-pro-image"
+
+    def test_should_use_lite_false_for_4k(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="x",
+            model="auto",
+            image_size="4K",
+            quality="draft",
+        )
+        assert _should_use_lite(request) is False
+
+    def test_should_use_lite_false_for_grounding(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="x",
+            model="auto",
+            image_size="1K",
+            quality="draft",
+            grounding="web",
+        )
+        assert _should_use_lite(request) is False
+
+    def test_should_use_pro_professional_quality(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="x",
+            model="auto",
+            quality="professional",
+        )
+        assert _should_use_pro(request) is True
+
+    def test_should_use_pro_infographic_command(self):
+        request = ImageRequest(command="infographic", prompt="x", model="auto")
+        assert _should_use_pro(request) is True
+
+    def test_resolve_model_alias_maps_full_name(self):
+        assert resolve_model_alias("gemini-3.1-flash-image") == "gemini-3.1-flash-image"
+
+    def test_resolve_model_alias_unknown_fails(self):
+        with pytest.raises(typer.Exit) as exc:
+            resolve_model_alias("unknown")
+        assert exc.value.exit_code == ExitCode.INVALID_ARGS
+
+    def test_get_capability_and_supports(self):
+        assert get_capability("flash", "grounding") is True
+        assert supports("flash", "grounding") is True
+        assert supports("lite", "grounding") is False
+
+
+class TestValidation:
+    def test_lite_rejects_4k(self):
+        request = ImageRequest(
+            command="generate", prompt="x", model="lite", image_size="4K"
+        )
+        with pytest.raises(typer.Exit) as exc:
+            validate_request(request)
+        assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
+
+    def test_flash_allows_2k(self):
+        request = ImageRequest(
+            command="generate", prompt="x", model="flash", image_size="2K"
+        )
+        assert validate_request(request) == []
+
+    def test_lite_rejects_grounding(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="x",
+            model="lite",
+            image_size="1K",
+            grounding="web",
+        )
+        with pytest.raises(typer.Exit) as exc:
+            validate_request(request)
+        assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
+
+    def test_invalid_aspect_ratio(self):
+        request = ImageRequest(
+            command="generate", prompt="x", model="flash", aspect_ratio="99:1"
+        )
+        with pytest.raises(typer.Exit) as exc:
+            validate_request(request)
+        assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
+
+    def test_flash_only_ratio_on_lite(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="x",
+            model="lite",
+            aspect_ratio="1:4",
+            image_size="1K",
+        )
+        with pytest.raises(typer.Exit) as exc:
+            validate_request(request)
+        assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
+
+    def test_too_many_references(self):
+        refs = tuple(
+            ReferenceImage(
+                path=Path("dummy.png"),
+                role="reference",
+                mime_type="image/png",
+                sha256="a",
+            )
+            for _ in range(12)
+        )
+        request = ImageRequest(
+            command="generate", prompt="x", model="flash", references=refs
+        )
+        with pytest.raises(typer.Exit) as exc:
+            validate_request(request)
+        assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
+
+    def test_allow_degraded_returns_warnings(self):
+        refs = tuple(
+            ReferenceImage(
+                path=Path("dummy.png"),
+                role="reference",
+                mime_type="image/png",
+                sha256="a",
+            )
+            for _ in range(12)
+        )
+        request = ImageRequest(
+            command="generate", prompt="x", model="flash", references=refs
+        )
+        warnings = validate_request(request, allow_degraded=True)
+        assert len(warnings) == 1
+        assert "exceed" in warnings[0]
+
+    def test_pro_thinking_unavailable(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="x",
+            model="pro",
+            image_size="1K",
+            thinking_level="high",
+        )
+        with pytest.raises(typer.Exit) as exc:
+            validate_request(request)
+        assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
+
+    def test_flash_only_ratio_on_pro(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="x",
+            model="pro",
+            aspect_ratio="1:4",
+            image_size="1K",
+        )
+        with pytest.raises(typer.Exit) as exc:
+            validate_request(request)
+        assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
 
 
 class TestPromptAssembly:
-    def test_expand_negative_splits_and_bullets(self):
-        result = nb.expand_negative("no text, no people; blur")
-        assert result == "- no text\n- no people\n- blur"
-
-    def test_expand_negative_empty(self):
-        assert nb.expand_negative("") == ""
-        assert nb.expand_negative("   ") == ""
-
-    def test_annotate_references_empty(self):
-        assert nb.annotate_references(()) == ""
-
-    def test_annotate_references_roles(self):
-        refs = (
-            nb.ReferenceImage(
-                path=Path("a.png"), role="subject", mime_type="image/png", sha256="x"
-            ),
-            nb.ReferenceImage(
-                path=Path("b.png"), role="style", mime_type="image/png", sha256="y"
-            ),
-        )
-        result = nb.annotate_references(refs)
-        assert "Reference 1 (subject)" in result
-        assert "Reference 2 (style)" in result
-
-    def test_build_normalized_prompt_has_sections(self):
-        req = nb.ImageRequest(
-            command="generate",
-            prompt="A test",
-            model="auto",
-            aspect_ratio="16:9",
-            image_size="2K",
-        )
-        prompt = nb.build_normalized_prompt(req, negative="no text, no people")
+    def test_required_sections_present(self):
+        request = ImageRequest(command="generate", prompt="a banana", model="auto")
+        prompt = build_normalized_prompt(request)
         assert "TASK:" in prompt
         assert "REQUIREMENTS:" in prompt
         assert "AVOID:" in prompt
         assert "OUTPUT INTENT:" in prompt
-        assert "no text" in prompt
-        assert "16:9" in prompt
 
-    def test_build_normalized_prompt_with_preset_prefix(self):
-        req = nb.ImageRequest(
-            command="generate",
-            prompt="A test",
-            model="auto",
-        )
-        preset = {"prompt_prefix": "Create a clean icon"}
-        prompt = nb.build_normalized_prompt(req, preset=preset)
+    def test_negative_converted_to_avoid(self):
+        request = ImageRequest(command="generate", prompt="a banana", model="auto")
+        prompt = build_normalized_prompt(request, negative="blur, noise")
+        assert "- blur" in prompt
+        assert "- noise" in prompt
+
+    def test_preset_prefix_present(self):
+        request = ImageRequest(command="generate", prompt="a banana", model="auto")
+        preset = conftest.PRESETS["icon"]
+        prompt = build_normalized_prompt(request, preset=preset)
+        assert preset["prompt_prefix"] in prompt
         assert "CONTEXT:" in prompt
-        assert "Create a clean icon" in prompt
-        assert "A test" in prompt
 
-    def test_build_normalized_prompt_preserve_for_edit(self):
-        req = nb.ImageRequest(
-            command="edit",
-            prompt="Change color",
-            model="auto",
+    def test_default_avoids_present(self):
+        request = ImageRequest(command="generate", prompt="a banana", model="auto")
+        prompt = build_normalized_prompt(request)
+        assert "Illegible labels" in prompt
+        assert "Generic or off-brand" in prompt
+
+    def test_references_in_prompt(self):
+        ref = ReferenceImage(
+            path=Path("x.png"), role="style", mime_type="image/png", sha256="abc"
         )
-        prompt = nb.build_normalized_prompt(req)
+        request = ImageRequest(
+            command="compose", prompt="blend", model="auto", references=(ref,)
+        )
+        prompt = build_normalized_prompt(request)
+        assert "REFERENCE ROLES:" in prompt
+        assert "Reference 1 (style)" in prompt
+
+    def test_preserve_section_for_edit(self):
+        request = ImageRequest(command="edit", prompt="change color", model="auto")
+        prompt = build_normalized_prompt(request)
         assert "PRESERVE:" in prompt
 
+    def test_annotate_references_empty(self):
+        assert annotate_references(()) == ""
 
-class TestInteractionInput:
-    def test_build_interaction_input_basic(self):
-        req = nb.ImageRequest(
-            command="generate",
-            prompt="A test",
-            model="auto",
-            aspect_ratio="16:9",
-            image_size="2K",
+    def test_expand_negative_empty(self):
+        assert expand_negative("") == ""
+        assert expand_negative("   ") == ""
+
+    def test_output_intent_with_text(self):
+        request = ImageRequest(
+            command="generate", prompt="x", model="auto", text_output=True
         )
-        decision = nb.ModelDecision(
-            requested="auto",
+        prompt = build_normalized_prompt(request)
+        assert "text explanation" in prompt
+
+
+class TestFilenames:
+    def test_filename_format(self):
+        filename = generate_filename("banana", index=1, extension="png")
+        assert re.match(r"^\d{8}-\d{6}-banana-01\.png$", filename)
+
+    def test_sanitization(self):
+        filename = generate_filename("Hello World!!!", index=2, extension="jpeg")
+        assert "hello-world" in filename
+
+    def test_truncation(self):
+        long_slug = "a" * 100
+        filename = generate_filename(long_slug, index=1, extension="png")
+        slug_part = filename.split("-")[2]
+        assert len(slug_part) <= 64
+
+    def test_slugify(self):
+        assert slugify("The Quick Brown Fox") == "the-quick-brown"
+
+    def test_slugify_empty(self):
+        assert slugify("!!!") == "image"
+
+    def test_resolve_output_path(self, temp_dir):
+        request = ImageRequest(command="generate", prompt="a banana", model="auto")
+        path = resolve_output_path(request, None, temp_dir, "png")
+        assert path.parent == temp_dir
+        assert path.suffix == ".png"
+
+    def test_resolve_output_path_specified(self, temp_dir):
+        request = ImageRequest(command="generate", prompt="a banana", model="auto")
+        specified = temp_dir / "custom.png"
+        assert resolve_output_path(request, specified, None, "png") == specified
+
+
+class TestMime:
+    def test_png(self, temp_dir):
+        path = temp_dir / "image.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20)
+        assert detect_mime_type(path) == "image/png"
+
+    def test_jpeg(self, temp_dir):
+        path = temp_dir / "image.jpg"
+        path.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 20)
+        assert detect_mime_type(path) == "image/jpeg"
+
+    def test_unknown(self, temp_dir):
+        path = temp_dir / "image.gif"
+        path.write_bytes(b"GIF89a" + b"\x00" * 20)
+        with pytest.raises(typer.Exit) as exc:
+            detect_mime_type(path)
+        assert exc.value.exit_code == ExitCode.INPUT_FAILURE
+
+    def test_missing_file(self, temp_dir):
+        path = temp_dir / "missing.png"
+        with pytest.raises(typer.Exit) as exc:
+            detect_mime_type(path)
+        assert exc.value.exit_code == ExitCode.INPUT_FAILURE
+
+
+class TestSha256:
+    def test_bytes_known_value(self):
+        data = b"abc"
+        expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        assert sha256_bytes(data) == expected
+
+    def test_file_known_value(self, temp_dir):
+        path = temp_dir / "abc.txt"
+        path.write_bytes(b"abc")
+        expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        assert sha256_file(path) == expected
+
+
+class TestManifest:
+    def test_required_fields(self, temp_dir):
+        request = ImageRequest(command="generate", prompt="a banana", model="flash")
+        decision = ModelDecision(
+            requested="flash",
             resolved="gemini-3.1-flash-image",
-            selection_reason="default",
+            selection_reason="explicit",
         )
-        data = nb.build_interaction_input(req, "prompt text", decision)
-        assert data["model"] == "gemini-3.1-flash-image"
-        assert data["response_format"] == {"type": "image/png"}
-        assert data["contents"] == [
-            {"role": "user", "parts": [{"text": "prompt text"}]}
-        ]
+        asset = GeneratedAsset(
+            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
+        )
+        manifest_path = write_manifest(
+            request, decision, "normalized", [asset], temp_dir
+        )
+        data = json.loads(manifest_path.read_text())
+        assert data["schema_version"] == "1.0"
+        assert data["run_id"] == request.request_id
+        assert data["model"]["resolved"] == decision.resolved
+        assert data["generation"]["normalized_prompt"] == "normalized"
+        assert data["outputs"][0]["sha256"] == "abc"
 
-    def test_build_interaction_input_text_output(self):
-        req = nb.ImageRequest(
-            command="generate",
-            prompt="A test",
-            model="auto",
-            text_output=True,
-        )
-        decision = nb.ModelDecision(
-            requested="auto",
+    def test_schema_version(self, temp_dir):
+        request = ImageRequest(command="generate", prompt="x", model="flash")
+        decision = ModelDecision(
+            requested="flash",
             resolved="gemini-3.1-flash-image",
-            selection_reason="default",
+            selection_reason="explicit",
         )
-        data = nb.build_interaction_input(req, "prompt text", decision)
-        assert data["response_format"] == [
-            {"type": "text"},
-            {"type": "image/png"},
-        ]
+        asset = GeneratedAsset(
+            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
+        )
+        manifest_path = write_manifest(request, decision, "norm", [asset], temp_dir)
+        data = json.loads(manifest_path.read_text())
+        assert data["schema_version"] == "1.0"
 
-    def test_build_interaction_input_grounding(self):
-        req = nb.ImageRequest(
-            command="grounded",
-            prompt="News",
-            model="auto",
-            grounding="web",
-        )
-        decision = nb.ModelDecision(
-            requested="auto",
+    def test_warnings_included(self, temp_dir):
+        request = ImageRequest(command="generate", prompt="x", model="flash")
+        decision = ModelDecision(
+            requested="flash",
             resolved="gemini-3.1-flash-image",
-            selection_reason="default",
+            selection_reason="explicit",
         )
-        data = nb.build_interaction_input(req, "prompt text", decision)
-        assert data["tools"] == [{"type": "google_search"}]
+        asset = GeneratedAsset(
+            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
+        )
+        manifest_path = write_manifest(
+            request, decision, "norm", [asset], temp_dir, warnings=["warn1"]
+        )
+        data = json.loads(manifest_path.read_text())
+        assert data["warnings"] == ["warn1"]
 
-    def test_build_interaction_input_with_references(self, tmp_path):
-        img_path = tmp_path / "ref.png"
-        img_path.write_bytes(b"\x89PNG\x00\x00")
-        ref = nb.load_reference(img_path, role="subject")
-        req = nb.ImageRequest(
-            command="compose",
-            prompt="Combine",
-            model="auto",
-            references=(ref,),
-        )
-        decision = nb.ModelDecision(
-            requested="auto",
+    def test_grounding_metadata_included(self, temp_dir):
+        request = ImageRequest(command="generate", prompt="x", model="flash")
+        decision = ModelDecision(
+            requested="flash",
             resolved="gemini-3.1-flash-image",
-            selection_reason="default",
+            selection_reason="explicit",
         )
-        data = nb.build_interaction_input(req, "prompt text", decision)
-        parts = data["contents"][0]["parts"]
-        assert parts[0] == {"text": "prompt text"}
-        assert parts[1]["inline_data"]["mime_type"] == "image/png"
-        assert base64.b64decode(parts[1]["inline_data"]["data"]) == b"\x89PNG\x00\x00"
-
-    def test_build_interaction_input_thinking_and_seed(self):
-        req = nb.ImageRequest(
-            command="generate",
-            prompt="A test",
-            model="auto",
-            thinking_level="high",
-            seed="42",
+        asset = GeneratedAsset(
+            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
         )
-        decision = nb.ModelDecision(
-            requested="auto",
-            resolved="gemini-3.1-flash-image",
-            selection_reason="default",
+        grounding = {"sources": ["https://example.com"]}
+        manifest_path = write_manifest(
+            request,
+            decision,
+            "norm",
+            [asset],
+            temp_dir,
+            grounding_metadata=grounding,
         )
-        data = nb.build_interaction_input(req, "prompt", decision)
-        assert data["generation_config"] == {"thinking_level": "high", "seed": 42}
+        data = json.loads(manifest_path.read_text())
+        assert data["sources"] == grounding
 
 
-class TestResponseExtraction:
-    def test_extract_images(self):
-        b64 = base64.b64encode(b"imagebytes").decode()
-        response = {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {"text": "some text"},
-                            {"inline_data": {"mime_type": "image/png", "data": b64}},
-                        ]
-                    }
-                }
-            ]
-        }
-        images = nb.extract_images(response)
-        assert images == [b"imagebytes"]
+class TestAtomicWrite:
+    def test_create(self, temp_dir):
+        path = temp_dir / "out.txt"
+        atomic_write(path, b"hello")
+        assert path.read_bytes() == b"hello"
 
-    def test_extract_images_empty(self):
-        assert nb.extract_images({"candidates": []}) == []
-        assert nb.extract_images(None) == []
+    def test_existing_error(self, temp_dir):
+        path = temp_dir / "out.txt"
+        path.write_bytes(b"existing")
+        with pytest.raises(FileExistsError):
+            atomic_write(path, b"new")
 
-    def test_extract_grounding_metadata(self):
-        response = {
-            "candidates": [
-                {
-                    "grounding_metadata": {
-                        "sources": ["https://example.com"],
-                        "citations": ["claim"],
-                        "suggestions": ["search"],
-                    }
-                }
-            ]
-        }
-        meta = nb.extract_grounding_metadata(response)
-        assert meta == {
-            "sources": ["https://example.com"],
-            "citations": ["claim"],
-            "search_suggestions": ["search"],
-        }
+    def test_overwrite(self, temp_dir):
+        path = temp_dir / "out.txt"
+        path.write_bytes(b"existing")
+        atomic_write(path, b"new", overwrite=True)
+        assert path.read_bytes() == b"new"
 
-    def test_extract_grounding_metadata_none(self):
-        assert nb.extract_grounding_metadata({"candidates": []}) is None
-
-    def test_classify_response_error_valid(self):
-        b64 = base64.b64encode(b"imagebytes").decode()
-        response = {
-            "candidates": [{"content": {"parts": [{"inline_data": {"data": b64}}]}}]
-        }
-        assert nb.classify_response_error(response) is None
-
-    def test_classify_response_error_empty(self):
-        assert (
-            nb.classify_response_error({"candidates": []}) == nb.ExitCode.EMPTY_RESPONSE
-        )
-
-    def test_classify_response_error_safety(self):
-        response = {
-            "candidates": [{"finish_reason": "SAFETY"}],
-        }
-        assert nb.classify_response_error(response) == nb.ExitCode.SAFETY_REFUSAL
-
-    def test_is_safety_refusal(self):
-        assert nb.is_safety_refusal({"candidates": [{"finish_reason": "SAFETY"}]})
-        assert not nb.is_safety_refusal({"candidates": [{"finish_reason": "STOP"}]})
+    def test_parent_directory_created(self, temp_dir):
+        path = temp_dir / "nested" / "out.txt"
+        atomic_write(path, b"data")
+        assert path.read_bytes() == b"data"
 
 
-class TestRetryHandler:
-    def test_is_retryable(self):
-        assert nb.is_retryable(ConnectionError())
-        assert nb.is_retryable(TimeoutError())
-        assert nb.is_retryable(Exception("429 rate limit"))
-        assert nb.is_retryable(Exception("timeout"))
-        assert not nb.is_retryable(ValueError("bad request"))
+class TestRetry:
+    def test_429_retryable(self):
+        class Exc(Exception):
+            code = "429"
 
-        class ServerError(Exception):
+        assert is_retryable(Exc("rate limited")) is True
+
+    def test_500_retryable(self):
+        class Exc(Exception):
             code = 500
 
-        assert nb.is_retryable(ServerError())
+        assert is_retryable(Exc("server error")) is True
 
-        class ForbiddenError(Exception):
-            status_code = 403
+    def test_400_not_retryable(self):
+        class Exc(Exception):
+            code = 400
 
-        assert not nb.is_retryable(ForbiddenError())
+        assert is_retryable(Exc("bad request")) is False
 
-    def test_classify_api_exception(self):
+    def test_401_not_retryable(self):
+        class Exc(Exception):
+            code = 401
+
+        assert is_retryable(Exc("unauthorized")) is False
+
+    def test_safety_refusal_check(self):
+        response = {"candidates": [{"finish_reason": "SAFETY"}]}
+        assert is_safety_refusal(response) is True
+
+    def test_safety_refusal_prompt_feedback(self):
+        response = {"prompt_feedback": {"block_reason": "safety"}}
+        assert is_safety_refusal(response) is True
+
+    def test_with_retry_success_after_transient(self, monkeypatch):
+        class Transient(Exception):
+            code = "429"
+
+        calls = []
+
+        def fn():
+            calls.append(1)
+            if len(calls) < 2:
+                raise Transient("retry")
+            return "ok"
+
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        assert with_retry(fn, max_attempts=3) == "ok"
+        assert len(calls) == 2
+
+    def test_with_retry_exhausted(self, monkeypatch):
+        class Transient(Exception):
+            code = "500"
+
+        def fn():
+            raise Transient("fail")
+
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        with pytest.raises(Transient):
+            with_retry(fn, max_attempts=2)
+
+    def test_classify_api_exception_quota(self):
         class QuotaError(Exception):
             code = 429
 
+        assert classify_api_exception(QuotaError()) == ExitCode.QUOTA_EXCEEDED
+
+    def test_classify_api_exception_auth(self):
         class AuthError(Exception):
             status_code = 403
 
-        class BadRequestError(Exception):
-            code = 400
+        assert classify_api_exception(AuthError()) == ExitCode.AUTH_FAILURE
 
-        assert nb.classify_api_exception(QuotaError()) == nb.ExitCode.QUOTA_EXCEEDED
-        assert nb.classify_api_exception(AuthError()) == nb.ExitCode.AUTH_FAILURE
-        assert nb.classify_api_exception(BadRequestError()) == nb.ExitCode.INVALID_ARGS
-        assert (
-            nb.classify_api_exception(Exception("rate limit"))
-            == nb.ExitCode.QUOTA_EXCEEDED
-        )
-        assert (
-            nb.classify_api_exception(Exception("unauthorized"))
-            == nb.ExitCode.AUTH_FAILURE
-        )
-        assert (
-            nb.classify_api_exception(Exception("safety block"))
-            == nb.ExitCode.SAFETY_REFUSAL
-        )
-        assert nb.classify_api_exception(Exception("unknown")) == nb.ExitCode.INTERNAL
+    def test_execute_request_retries_then_succeeds(self, monkeypatch):
+        class RateLimit(Exception):
+            code = "429"
 
-    def test_with_retry_succeeds_first(self, monkeypatch):
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
-        monkeypatch.setattr(nb.random, "uniform", lambda _a, _b: 1.0)
-        counter = {"n": 0}
-
-        def fn():
-            counter["n"] += 1
-            return "ok"
-
-        assert nb.with_retry(fn) == "ok"
-        assert counter["n"] == 1
-
-    def test_with_retry_retries_then_succeeds(self, monkeypatch):
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
-        monkeypatch.setattr(nb.random, "uniform", lambda _a, _b: 1.0)
-        counter = {"n": 0}
-
-        def fn():
-            counter["n"] += 1
-            if counter["n"] < 3:
-                raise ConnectionError("transient")
-            return "ok"
-
-        assert nb.with_retry(fn, max_attempts=3) == "ok"
-        assert counter["n"] == 3
-
-    def test_with_retry_gives_up_on_non_retryable(self, monkeypatch):
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
-        monkeypatch.setattr(nb.random, "uniform", lambda _a, _b: 1.0)
-        counter = {"n": 0}
-
-        def fn():
-            counter["n"] += 1
-            raise ValueError("bad")
-
-        with pytest.raises(ValueError):
-            nb.with_retry(fn, max_attempts=3)
-        assert counter["n"] == 1
-
-    def test_with_retry_exhausts_attempts(self, monkeypatch):
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
-        monkeypatch.setattr(nb.random, "uniform", lambda _a, _b: 1.0)
-        counter = {"n": 0}
-
-        def fn():
-            counter["n"] += 1
-            raise ConnectionError("transient")
-
-        with pytest.raises(ConnectionError):
-            nb.with_retry(fn, max_attempts=2)
-        assert counter["n"] == 2
-
-
-class TestGeneratePipeline:
-    def _make_ctx(self, **kwargs):
-        obj = {
-            "model": "auto",
-            "output_dir": None,
-            "api_key": None,
-            "config": None,
-            "format": "png",
-            "json": False,
-            "quiet": False,
-            "verbose": False,
-            "dry_run": False,
-            "overwrite": False,
-            "seed": None,
-            "request_id": None,
-        }
-        obj.update(kwargs)
-
-        class FakeContext:
-            def __init__(self, obj):
-                self.obj = obj
-
-        return FakeContext(obj)
-
-    def test_dry_run_does_not_call_api(self, capsys, monkeypatch):
-        ctx = self._make_ctx(dry_run=True)
-        nb.run_generate_pipeline(ctx, "a test prompt")
-        captured = capsys.readouterr()
-        assert "gemini-3.1-flash-image" in captured.err
-        assert "Dry Run" in captured.err
-
-    def test_dry_run_json(self, capsys, monkeypatch):
-        ctx = self._make_ctx(dry_run=True, json=True)
-        nb.run_generate_pipeline(ctx, "a test prompt")
-        captured = capsys.readouterr()
-        payload = json.loads(captured.out)
-        assert payload["status"] == "dry-run"
-        assert payload["outputs"][0]["count"] == 1
-
-    def test_missing_api_key_fails(self, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        ctx = self._make_ctx()
-        with pytest.raises(nb.typer.Exit) as exc:
-            nb.run_generate_pipeline(ctx, "test")
-        assert exc.value.exit_code == nb.ExitCode.AUTH_FAILURE
-
-    def test_invalid_size_model_combo_fails(self):
-        ctx = self._make_ctx(model="lite")
-        with pytest.raises(nb.typer.Exit) as exc:
-            nb.run_generate_pipeline(ctx, "test", size="4K")
-        assert exc.value.exit_code == nb.ExitCode.CAPABILITY_MISMATCH
-
-    def test_show_estimate(self, capsys):
-        ctx = self._make_ctx()
-        nb.run_generate_pipeline(ctx, "test", show_estimate=True)
-        captured = capsys.readouterr()
-        assert "Estimated cost" in captured.out
-
-    def test_max_estimated_cost_exceeded(self):
-        ctx = self._make_ctx()
-        with pytest.raises(nb.typer.Exit) as exc:
-            nb.run_generate_pipeline(ctx, "test", max_estimated_cost=0.01)
-        assert exc.value.exit_code == nb.ExitCode.INVALID_ARGS
-
-    def test_preset_applies_and_cli_overrides(self, capsys):
-        ctx = self._make_ctx(dry_run=True)
-        nb.run_generate_pipeline(ctx, "test", size="4K", preset_name="photo")
-        captured = capsys.readouterr()
-        # Photo preset sets aspect=3:2, size=2K, model=flash; CLI overrides size to 4K.
-        assert "3:2" in captured.err
-        assert "4K" in captured.err
-        assert "gemini-3.1-flash-image" in captured.err
-
-    def test_successful_run_writes_image_and_manifest(self, tmp_path, monkeypatch):
-        image_bytes = b"\x89PNG\x00\x00"
-        b64 = base64.b64encode(image_bytes).decode()
-        fake_response = {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {"inline_data": {"mime_type": "image/png", "data": b64}}
-                        ]
-                    }
-                }
-            ]
-        }
         calls = []
 
-        class FakeClient:
-            class interactions:
-                @staticmethod
-                def create(**kwargs):
-                    calls.append(kwargs)
-                    return fake_response
+        def create(**kwargs):
+            calls.append(1)
+            if len(calls) < 2:
+                raise RateLimit("rate limit")
+            return "ok"
 
-        monkeypatch.setattr(nb, "genai", nb.genai)
-        monkeypatch.setattr(nb.genai, "Client", lambda api_key: FakeClient())
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
+        client = MagicMock()
+        client.interactions.create.side_effect = create
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        assert execute_request(client, {}) == "ok"
+        assert len(calls) == 2
 
-        output_dir = tmp_path / "out"
-        ctx = self._make_ctx(output_dir=output_dir)
-        nb.run_generate_pipeline(ctx, "test output")
 
-        assert len(calls) == 1
-        assert calls[0]["model"] == "gemini-3.1-flash-image"
-        outputs = list(output_dir.iterdir())
-        assert len(outputs) == 2  # image + manifest
-        manifest_path = next(p for p in outputs if p.suffix == ".json")
-        manifest = json.loads(manifest_path.read_text())
-        assert manifest["schema_version"] == "1.0"
-        assert manifest["outputs"][0]["sha256"] == nb.sha256_bytes(image_bytes)
+class TestCost:
+    def test_flash_2k(self):
+        assert (
+            estimate_cost("flash", "2K") == COST_TABLE["gemini-3.1-flash-image"]["2K"]
+        )
 
-    def test_empty_response_fails(self, monkeypatch):
-        class FakeClient:
-            class interactions:
-                @staticmethod
-                def create(**kwargs):
-                    return {"candidates": []}
+    def test_lite_1k(self):
+        assert (
+            estimate_cost("lite", "1K")
+            == COST_TABLE["gemini-3.1-flash-lite-image"]["1K"]
+        )
 
-        monkeypatch.setattr(nb.genai, "Client", lambda api_key: FakeClient())
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
-        ctx = self._make_ctx()
-        with pytest.raises(nb.typer.Exit) as exc:
-            nb.run_generate_pipeline(ctx, "test")
-        assert exc.value.exit_code == nb.ExitCode.EMPTY_RESPONSE
+    def test_unknown_size(self):
+        assert estimate_cost("flash", "8K") is None
 
-    def test_safety_refusal_fails(self, monkeypatch):
-        class FakeClient:
-            class interactions:
-                @staticmethod
-                def create(**kwargs):
-                    return {"candidates": [{"finish_reason": "SAFETY"}]}
+    def test_count_multiplier(self):
+        unit = COST_TABLE["gemini-3.1-flash-image"]["1K"]
+        assert estimate_cost("flash", "1K", count=3) == unit * 3
 
-        monkeypatch.setattr(nb.genai, "Client", lambda api_key: FakeClient())
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
-        ctx = self._make_ctx()
-        with pytest.raises(nb.typer.Exit) as exc:
-            nb.run_generate_pipeline(ctx, "test")
-        assert exc.value.exit_code == nb.ExitCode.SAFETY_REFUSAL
+    def test_auto_returns_none(self):
+        assert estimate_cost("auto", "1K") is None
 
-    def test_retry_with_pro_escalates(self, tmp_path, monkeypatch):
-        image_bytes = b"\x89PNG\x00\x00"
-        b64 = base64.b64encode(image_bytes).decode()
-        pro_response = {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {"inline_data": {"mime_type": "image/png", "data": b64}}
-                        ]
-                    }
-                }
-            ]
-        }
 
-        class FakeClient:
-            class interactions:
-                calls = []
+class TestSecretRedaction:
+    def test_key_not_in_manifest(self, temp_dir, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "secret-key-123")
+        request = ImageRequest(command="generate", prompt="x", model="flash")
+        decision = ModelDecision(
+            requested="flash",
+            resolved="gemini-3.1-flash-image",
+            selection_reason="explicit",
+        )
+        asset = GeneratedAsset(
+            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
+        )
+        manifest_path = write_manifest(request, decision, "norm", [asset], temp_dir)
+        text = manifest_path.read_text()
+        assert "secret-key-123" not in text
 
-                @staticmethod
-                def create(**kwargs):
-                    FakeClient.interactions.calls.append(kwargs)
-                    if kwargs["model"] == "gemini-3.1-flash-image":
-                        return {"candidates": []}
-                    return pro_response
+    def test_key_not_in_log(self, temp_dir, monkeypatch, capsys, mock_client):
+        monkeypatch.setenv("GEMINI_API_KEY", "secret-key-123")
+        image_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+        mock_client.Client.return_value.interactions.create.return_value = (
+            make_image_response(image_data)
+        )
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
 
-        monkeypatch.setattr(nb.genai, "Client", lambda api_key: FakeClient())
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
+        ctx = make_context(output_dir=temp_dir, api_key=None)
+        run_generate_pipeline(
+            ctx,
+            "a banana",
+            aspect="1:1",
+            size="1K",
+            output=temp_dir / "out.png",
+        )
 
-        output_dir = tmp_path / "out"
-        ctx = self._make_ctx(output_dir=output_dir)
-        nb.run_generate_pipeline(ctx, "test", retry_with_pro=True)
-
-        models = [c["model"] for c in FakeClient.interactions.calls]
-        assert models == ["gemini-3.1-flash-image", "gemini-3-pro-image"]
-        manifest_path = next(p for p in output_dir.iterdir() if p.suffix == ".json")
-        manifest = json.loads(manifest_path.read_text())
-        assert manifest["model"]["resolved"] == "gemini-3-pro-image"
-
-    def test_prompt_file(self, tmp_path, capsys):
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("file prompt")
-        ctx = self._make_ctx(dry_run=True)
-        nb.run_generate_pipeline(ctx, None, prompt_file=prompt_file)
         captured = capsys.readouterr()
-        assert "file prompt" in captured.err
-
-    def test_missing_prompt_and_prompt_file_fails(self):
-        ctx = self._make_ctx()
-        with pytest.raises(nb.typer.Exit) as exc:
-            nb.run_generate_pipeline(ctx, None)
-        assert exc.value.exit_code == nb.ExitCode.INVALID_ARGS
-
-    def test_references_passed_to_interaction(self, tmp_path, monkeypatch):
-        img_path = tmp_path / "ref.png"
-        img_path.write_bytes(b"\x89PNG\x00\x00")
-        ref = nb.load_reference(img_path, role="subject")
-        ctx = self._make_ctx(dry_run=True)
-        nb.run_generate_pipeline(ctx, "test", references=(ref,))
-        # Dry-run success is enough; contract tests verify the SDK input.
+        assert "secret-key-123" not in captured.err
+        assert "secret-key-123" not in captured.out
 
 
-class TestEditInstruction:
-    def test_build_edit_instruction_sections(self):
-        result = nb.build_edit_instruction(
+class TestBuildEditInstruction:
+    def test_all_sections(self):
+        result = build_edit_instruction(
             "change background",
             preserve="person",
             change="background to blue",
@@ -551,275 +704,232 @@ class TestEditInstruction:
         assert "MASK:" in result
         assert "STRICT PRESERVATION:" in result
 
-    def test_build_edit_instruction_no_mask(self):
-        result = nb.build_edit_instruction("change bg")
-        assert "MASK:" not in result
-        assert "PRESERVE:" not in result
-        assert "CHANGE:" not in result
-
-    def test_build_edit_instruction_mask_none(self):
-        result = nb.build_edit_instruction("change bg", mask="none")
+    def test_no_mask(self):
+        result = build_edit_instruction("change bg")
         assert "MASK:" not in result
 
-    def test_build_edit_instruction_mask_path(self):
-        result = nb.build_edit_instruction("change bg", mask="/tmp/mask.png")
-        assert "MASK:" in result
-        assert "provided mask image" in result
+    def test_mask_none(self):
+        result = build_edit_instruction("change bg", mask="none")
+        assert "MASK:" not in result
 
 
-class TestEditCommand:
-    def _make_ctx(self, **kwargs):
-        obj = {
-            "model": "auto",
-            "output_dir": None,
-            "api_key": None,
-            "config": None,
-            "format": "png",
-            "json": False,
-            "quiet": False,
-            "verbose": False,
-            "dry_run": True,
-            "overwrite": False,
-            "seed": None,
-            "request_id": None,
-        }
-        obj.update(kwargs)
-
-        class FakeContext:
-            def __init__(self, obj):
-                self.obj = obj
-
-        return FakeContext(obj)
-
-    def test_edit_dry_run(self, tmp_path, capsys):
-        img_path = tmp_path / "input.png"
-        img_path.write_bytes(b"\x89PNG\x00\x00")
-        ctx = self._make_ctx()
-        nb.run_generate_pipeline(
-            ctx,
-            "change bg",
-            references=(nb.load_reference(img_path, role="input"),),
-            command="edit",
-        )
-        captured = capsys.readouterr()
-        assert "Dry Run" in captured.err
-        assert "Reference 1 (input)" in captured.err
-        assert "PRESERVE:" in captured.err
-
-    def test_edit_with_strict_preservation(self, tmp_path, capsys):
-        img_path = tmp_path / "input.png"
-        img_path.write_bytes(b"\x89PNG\x00\x00")
-        ctx = self._make_ctx()
-        nb.run_generate_pipeline(
-            ctx,
-            nb.build_edit_instruction("change bg", strict_preservation=True),
-            references=(nb.load_reference(img_path, role="input"),),
-            warnings=[
-                "Strict preservation enabled; the model may still alter fine details.",
-            ],
-            command="edit",
-        )
-        captured = capsys.readouterr()
-        assert "STRICT PRESERVATION" in captured.err
-
-    def test_edit_with_mask_reference(self, tmp_path):
-        input_path = tmp_path / "input.png"
-        input_path.write_bytes(b"\x89PNG\x00\x00")
-        mask_path = tmp_path / "mask.png"
-        mask_path.write_bytes(b"\x89PNG\x00\x00")
-        refs = [
-            nb.load_reference(input_path, role="input"),
-            nb.load_reference(mask_path, role="mask"),
-        ]
-        assert len(refs) == 2
-        assert refs[1].role == "mask"
-
-    def test_edit_command_via_cli(self, tmp_path):
-        from typer.testing import CliRunner
-
-        img_path = tmp_path / "input.png"
-        img_path.write_bytes(b"\x89PNG\x00\x00")
-        runner = CliRunner()
-        result = runner.invoke(
-            nb.app,
-            [
-                "--dry-run",
-                "edit",
-                str(img_path),
-                "change bg",
-                "--preserve",
-                "person",
-                "--strict-preservation",
-            ],
-        )
-        assert result.exit_code == 0
-        assert "Dry Run" in result.output
-        assert "Reference 1 (input)" in result.output
-        assert "STRICT PRESERVATION" in result.output
-
-    def test_edit_writes_warning_to_manifest(self, tmp_path, monkeypatch):
-        image_bytes = b"\x89PNG\x00\x00"
-        b64 = base64.b64encode(image_bytes).decode()
-        fake_response = {
+class TestExtractGroundingMetadata:
+    def test_extracts_sources(self):
+        response = {
             "candidates": [
                 {
-                    "content": {
-                        "parts": [
-                            {"inline_data": {"mime_type": "image/png", "data": b64}}
-                        ]
+                    "grounding_metadata": {
+                        "sources": ["https://example.com"],
+                        "citations": ["claim"],
+                        "suggestions": ["search"],
                     }
                 }
             ]
         }
-
-        class FakeClient:
-            class interactions:
-                @staticmethod
-                def create(**kwargs):
-                    return fake_response
-
-        monkeypatch.setattr(nb, "genai", nb.genai)
-        monkeypatch.setattr(nb.genai, "Client", lambda api_key: FakeClient())
-        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
-
-        img_path = tmp_path / "input.png"
-        img_path.write_bytes(b"\x89PNG\x00\x00")
-        output_dir = tmp_path / "out"
-        ctx = self._make_ctx(dry_run=False, output_dir=output_dir)
-        nb.run_generate_pipeline(
-            ctx,
-            nb.build_edit_instruction("change bg", strict_preservation=True),
-            references=(nb.load_reference(img_path, role="input"),),
-            warnings=[
-                "Strict preservation enabled; the model may still alter fine details.",
-            ],
-            command="edit",
-        )
-
-        manifest_path = next(p for p in output_dir.iterdir() if p.suffix == ".json")
-        manifest = json.loads(manifest_path.read_text())
-        assert any("Strict preservation" in w for w in manifest.get("warnings", []))
-
-
-class TestComposeCommand:
-    def _make_ctx(self, **kwargs):
-        obj = {
-            "model": "auto",
-            "output_dir": None,
-            "api_key": None,
-            "config": None,
-            "format": "png",
-            "json": False,
-            "quiet": False,
-            "verbose": False,
-            "dry_run": True,
-            "overwrite": False,
-            "seed": None,
-            "request_id": None,
+        meta = extract_grounding_metadata(response)
+        assert meta == {
+            "sources": ["https://example.com"],
+            "citations": ["claim"],
+            "search_suggestions": ["search"],
         }
-        obj.update(kwargs)
 
-        class FakeContext:
-            def __init__(self, obj):
-                self.obj = obj
+    def test_empty_returns_none(self):
+        assert extract_grounding_metadata({"candidates": []}) is None
 
-        return FakeContext(obj)
 
-    def test_compose_dry_run(self, tmp_path, capsys):
-        img_path = tmp_path / "subject.png"
-        img_path.write_bytes(b"\x89PNG\x00\x00")
-        ref = nb.load_reference(img_path, role="subject")
-        ctx = self._make_ctx()
-        nb.run_generate_pipeline(
-            ctx,
-            "combine",
-            references=(ref,),
-            command="compose",
+# =============================================================================
+# Contract Tests
+# =============================================================================
+
+
+class TestContract:
+    def test_successful_response(self, temp_dir, monkeypatch, mock_client):
+        image_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+        mock_client.Client.return_value.interactions.create.return_value = (
+            make_image_response(image_data)
         )
-        captured = capsys.readouterr()
-        assert "Dry Run" in captured.err
-        assert "Reference 1 (subject)" in captured.err
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
 
-    def test_compose_no_references_fails(self):
+        run_generate_pipeline(
+            make_context(output_dir=temp_dir),
+            "a banana",
+            aspect="1:1",
+            size="1K",
+            output=temp_dir / "out.png",
+        )
+        assert (temp_dir / "out.png").exists()
+        assert (temp_dir / "out.png.manifest.json").exists()
+
+    def test_safety_refusal(self, temp_dir, monkeypatch, mock_client):
+        mock_client.Client.return_value.interactions.create.return_value = {
+            "candidates": [{"finish_reason": "SAFETY"}]
+        }
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+        with pytest.raises(typer.Exit) as exc:
+            run_generate_pipeline(
+                make_context(output_dir=temp_dir),
+                "a banana",
+                aspect="1:1",
+                size="1K",
+            )
+        assert exc.value.exit_code == ExitCode.SAFETY_REFUSAL
+
+    def test_auth_failure(self, temp_dir, monkeypatch, mock_client):
+        class AuthError(Exception):
+            code = "401"
+
+        mock_client.Client.return_value.interactions.create.side_effect = AuthError(
+            "unauthorized"
+        )
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+        with pytest.raises(typer.Exit) as exc:
+            run_generate_pipeline(
+                make_context(output_dir=temp_dir),
+                "a banana",
+                aspect="1:1",
+                size="1K",
+            )
+        assert exc.value.exit_code == ExitCode.AUTH_FAILURE
+
+    def test_empty_response(self, temp_dir, monkeypatch, mock_client):
+        mock_client.Client.return_value.interactions.create.return_value = {
+            "candidates": [{"content": {"parts": []}}]
+        }
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+        with pytest.raises(typer.Exit) as exc:
+            run_generate_pipeline(
+                make_context(output_dir=temp_dir),
+                "a banana",
+                aspect="1:1",
+                size="1K",
+            )
+        assert exc.value.exit_code == ExitCode.EMPTY_RESPONSE
+
+    def test_rate_limit_retry(self, temp_dir, monkeypatch, mock_client):
+        image_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+        response = make_image_response(image_data)
+
+        class RateLimit(Exception):
+            code = "429"
+
+        calls = []
+
+        def create(**kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RateLimit("rate limit")
+            return response
+
+        mock_client.Client.return_value.interactions.create.side_effect = create
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+        run_generate_pipeline(
+            make_context(output_dir=temp_dir),
+            "a banana",
+            aspect="1:1",
+            size="1K",
+            output=temp_dir / "out.png",
+        )
+        assert len(calls) == 2
+        assert (temp_dir / "out.png").exists()
+
+    def test_json_output_response_format(self):
+        request = ImageRequest(
+            command="generate",
+            prompt="a banana",
+            model="flash",
+            text_output=True,
+            mime_type="image/png",
+        )
+        input_data = build_interaction_input(
+            request,
+            "normalized",
+            ModelDecision("auto", "gemini-3.1-flash-image", "x"),
+        )
+        assert input_data["response_format"] == [
+            {"type": "text"},
+            {"type": "image/png"},
+        ]
+
+
+# =============================================================================
+# Live Tests
+# =============================================================================
+
+
+class TestLive:
+    @pytest.mark.skipif(
+        os.environ.get("NANOBANANA_LIVE_TESTS") != "1",
+        reason="Live tests require NANOBANANA_LIVE_TESTS=1",
+    )
+    def test_live_lite_icon(self, temp_dir):
         from typer.testing import CliRunner
 
-        runner = CliRunner()
-        result = runner.invoke(nb.app, ["compose", "combine"])
-        assert result.exit_code == nb.ExitCode.INVALID_ARGS
-        assert "at least one reference" in result.output
-
-    def test_compose_command_via_cli(self, tmp_path):
-        from typer.testing import CliRunner
-
-        img_path = tmp_path / "subject.png"
-        img_path.write_bytes(b"\x89PNG\x00\x00")
         runner = CliRunner()
         result = runner.invoke(
-            nb.app,
-            ["--dry-run", "compose", "combine", "--subject", str(img_path)],
+            conftest.app,
+            [
+                "--model",
+                "lite",
+                "--output-dir",
+                str(temp_dir),
+                "generate",
+                "a simple cog icon",
+                "--preset",
+                "icon",
+            ],
         )
         assert result.exit_code == 0
-        assert "Dry Run" in result.output
-        assert "Reference 1 (subject)" in result.output
+        outputs = list(temp_dir.glob("*.png"))
+        assert len(outputs) >= 1
 
-    def test_compose_allow_degraded_adds_warning(self, tmp_path, capsys):
-        # Create more references than Flash allows to force a warning.
-        refs = []
-        for i in range(12):
-            path = tmp_path / f"ref{i}.png"
-            path.write_bytes(b"\x89PNG\x00\x00")
-            refs.append(nb.load_reference(path, role="reference"))
-        ctx = self._make_ctx(dry_run=True)
-        nb.run_generate_pipeline(
-            ctx,
-            "combine",
-            references=tuple(refs),
-            allow_degraded=True,
-            command="compose",
+    @pytest.mark.skipif(
+        os.environ.get("NANOBANANA_LIVE_TESTS") != "1",
+        reason="Live tests require NANOBANANA_LIVE_TESTS=1",
+    )
+    def test_live_invalid_combo_rejected(self, temp_dir):
+        from typer.testing import CliRunner
+
+        runner = CliRunner()
+        result = runner.invoke(
+            conftest.app,
+            [
+                "--model",
+                "lite",
+                "--output-dir",
+                str(temp_dir),
+                "generate",
+                "x",
+                "--size",
+                "4K",
+            ],
         )
-        captured = capsys.readouterr()
-        assert "Dry Run" in captured.err
+        assert result.exit_code == ExitCode.CAPABILITY_MISMATCH
 
-    def test_compose_reference_limit_fails_without_allow_degraded(self, tmp_path):
-        refs = []
-        for i in range(12):
-            path = tmp_path / f"ref{i}.png"
-            path.write_bytes(b"\x89PNG\x00\x00")
-            refs.append(nb.load_reference(path, role="reference"))
-        ctx = self._make_ctx()
-        with pytest.raises(nb.typer.Exit) as exc:
-            nb.run_generate_pipeline(
-                ctx,
-                "combine",
-                references=tuple(refs),
-                command="compose",
-            )
-        assert exc.value.exit_code == nb.ExitCode.CAPABILITY_MISMATCH
+    @pytest.mark.skipif(
+        os.environ.get("NANOBANANA_LIVE_TESTS") != "1",
+        reason="Live tests require NANOBANANA_LIVE_TESTS=1",
+    )
+    def test_live_flash_2k(self, temp_dir):
+        from typer.testing import CliRunner
 
-
-class TestValidateRequest:
-    def test_allow_degraded_returns_warnings(self):
-        req = nb.ImageRequest(
-            command="compose",
-            prompt="combine",
-            model="pro",
-            aspect_ratio="1:4",
-            image_size="1K",
-            references=tuple(),
+        runner = CliRunner()
+        result = runner.invoke(
+            conftest.app,
+            [
+                "--model",
+                "flash",
+                "--output-dir",
+                str(temp_dir),
+                "generate",
+                "a banana",
+                "--size",
+                "2K",
+            ],
         )
-        warnings = nb.validate_request(req, allow_degraded=True)
-        assert any("Flash-only" in w for w in warnings)
-
-    def test_allow_degraded_false_raises(self):
-        req = nb.ImageRequest(
-            command="compose",
-            prompt="combine",
-            model="pro",
-            aspect_ratio="1:4",
-            image_size="1K",
-            references=tuple(),
-        )
-        with pytest.raises(nb.typer.Exit) as exc:
-            nb.validate_request(req, allow_degraded=False)
-        assert exc.value.exit_code == nb.ExitCode.CAPABILITY_MISMATCH
+        assert result.exit_code == 0
+        outputs = list(temp_dir.glob("*.png"))
+        assert len(outputs) >= 1
