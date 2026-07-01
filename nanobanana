@@ -482,8 +482,12 @@ def select_model(request: ImageRequest) -> ModelDecision:
     )
 
 
-def validate_request(request: ImageRequest, allow_degraded: bool = False) -> None:
-    """Validate request against model capabilities before API calls."""
+def validate_request(request: ImageRequest, allow_degraded: bool = False) -> list[str]:
+    """Validate request against model capabilities before API calls.
+
+    Returns a list of capability warnings. When allow_degraded is False, issues
+    raise an exception instead of being returned.
+    """
     if request.model == "auto":
         resolved_model = select_model(request).resolved
     else:
@@ -547,6 +551,7 @@ def validate_request(request: ImageRequest, allow_degraded: bool = False) -> Non
             ExitCode.CAPABILITY_MISMATCH,
             "Capability mismatch: " + "; ".join(issues),
         )
+    return issues
 
 
 def estimate_cost(model: str, size: str, count: int = 1) -> float | None:
@@ -1189,6 +1194,39 @@ def _resolve_output_path_for_image(
     return resolve_output_path(request, None, output_dir, fmt)
 
 
+def build_edit_instruction(
+    instruction: str,
+    preserve: str | None = None,
+    change: str | None = None,
+    mask: str | None = None,
+    strict_preservation: bool = False,
+) -> str:
+    """Build a full edit instruction with preservation and change sections."""
+    sections: list[str] = [instruction.strip()]
+    if preserve:
+        sections.append(f"PRESERVE:\n- {preserve.strip()}")
+    if change:
+        sections.append(f"CHANGE:\n- {change.strip()}")
+    if mask:
+        mask_lower = mask.lower().strip()
+        if mask_lower == "semantic":
+            sections.append(
+                "MASK: apply changes only to the semantically described regions; "
+                "preserve everything else.",
+            )
+        elif mask_lower != "none":
+            sections.append(
+                "MASK: use the provided mask image to guide the edit. "
+                "Pixel-accurate masking is not guaranteed in this version.",
+            )
+    if strict_preservation:
+        sections.append(
+            "STRICT PRESERVATION: preserve all original identity, structure, "
+            "proportions, and details unless explicitly listed in CHANGE.",
+        )
+    return "\n\n".join(sections)
+
+
 def run_generate_pipeline(
     ctx: typer.Context,
     prompt: str | None,
@@ -1207,6 +1245,10 @@ def run_generate_pipeline(
     preset_name: str | None = None,
     max_estimated_cost: float | None = None,
     show_estimate: bool = False,
+    references: tuple[ReferenceImage, ...] = (),
+    allow_degraded: bool = False,
+    warnings: list[str] | None = None,
+    command: str = "generate",
 ) -> None:
     """Execute the full generate pipeline from prompt to manifest."""
     # 1. Read prompt from file if provided, else use the positional argument.
@@ -1262,9 +1304,10 @@ def run_generate_pipeline(
 
     # 3. Build the typed request object.
     request = ImageRequest(
-        command="generate",
+        command=command,
         prompt=prompt_text,
         model=model_alias,
+        references=references,
         aspect_ratio=aspect,
         image_size=size,
         mime_type=MIME_MAP.get(fmt, "image/png"),
@@ -1296,7 +1339,10 @@ def run_generate_pipeline(
         model=decision.resolved,
         reason=decision.selection_reason,
     )
-    validate_request(request)
+    capability_warnings = validate_request(request, allow_degraded=allow_degraded)
+    if warnings is None:
+        warnings = []
+    warnings.extend(capability_warnings)
 
     # 6. Cost ceiling / estimate display.
     cost = estimate_cost(decision.resolved, request.image_size or "1K", request.count)
@@ -1399,7 +1445,7 @@ def run_generate_pipeline(
         )
         pro_request = replace(request, model="pro", request_id=str(uuid.uuid4()))
         try:
-            validate_request(pro_request)
+            validate_request(pro_request, allow_degraded=allow_degraded)
             response = _execute(pro_request, pro_decision)
             response_error = classify_response_error(response)
             if response_error is None:
@@ -1452,6 +1498,7 @@ def run_generate_pipeline(
         assets,
         output_dir,
         grounding_metadata=grounding_metadata,
+        warnings=warnings,
     )
 
     # 15. Emit machine-readable or human-readable status.
@@ -1562,7 +1609,9 @@ def generate(
 def edit(
     ctx: typer.Context,
     input_image: Annotated[Path, typer.Argument(help="Input image to edit")],
-    instruction: Annotated[str, typer.Argument(help="Editing instruction")],
+    instruction: Annotated[
+        str | None, typer.Argument(help="Editing instruction")
+    ] = None,
     instruction_file: Annotated[
         Path | None,
         typer.Option("--instruction-file", help="Read instruction from file"),
@@ -1588,7 +1637,51 @@ def edit(
     ] = False,
 ) -> None:
     """Modify an existing image while preserving selected elements."""
-    fail(ExitCode.INTERNAL, "edit: not yet implemented")
+    if instruction_file is not None:
+        try:
+            instruction_text = instruction_file.read_text()
+        except Exception as exc:
+            fail(ExitCode.INPUT_FAILURE, f"Failed to read instruction file: {exc}")
+    elif instruction:
+        instruction_text = instruction
+    else:
+        fail(
+            ExitCode.INVALID_ARGS,
+            "Provide an instruction argument or --instruction-file.",
+        )
+
+    input_ref = load_reference(input_image, role="input")
+    references: list[ReferenceImage] = [input_ref]
+    if mask:
+        mask_lower = mask.lower().strip()
+        if mask_lower not in {"semantic", "none"}:
+            mask_path = Path(mask)
+            references.append(load_reference(mask_path, role="mask"))
+
+    full_instruction = build_edit_instruction(
+        instruction_text,
+        preserve=preserve,
+        change=change,
+        mask=mask,
+        strict_preservation=strict_preservation,
+    )
+
+    warnings: list[str] = []
+    if strict_preservation:
+        warnings.append(
+            "Strict preservation enabled; the model may still alter fine details.",
+        )
+
+    run_generate_pipeline(
+        ctx,
+        full_instruction,
+        aspect=aspect,
+        size=size,
+        output=output,
+        references=tuple(references),
+        warnings=warnings,
+        command="edit",
+    )
 
 
 @app.command()
@@ -1628,7 +1721,32 @@ def compose(
     ] = False,
 ) -> None:
     """Combine multiple reference images into a coherent output."""
-    fail(ExitCode.INTERNAL, "compose: not yet implemented")
+    references = load_references(
+        subject=subject,
+        object_ref=object_ref,
+        character=character,
+        style=style,
+        background=background,
+        reference=reference,
+    )
+
+    if not references:
+        fail(
+            ExitCode.INVALID_ARGS,
+            "Provide at least one reference image (--subject, --object, --character, "
+            "--style, --background, or --reference).",
+        )
+
+    run_generate_pipeline(
+        ctx,
+        instruction,
+        aspect=aspect,
+        size=size,
+        output=output,
+        references=references,
+        allow_degraded=allow_degraded,
+        command="compose",
+    )
 
 
 @app.command()

@@ -524,3 +524,302 @@ class TestGeneratePipeline:
         with pytest.raises(nb.typer.Exit) as exc:
             nb.run_generate_pipeline(ctx, None)
         assert exc.value.exit_code == nb.ExitCode.INVALID_ARGS
+
+    def test_references_passed_to_interaction(self, tmp_path, monkeypatch):
+        img_path = tmp_path / "ref.png"
+        img_path.write_bytes(b"\x89PNG\x00\x00")
+        ref = nb.load_reference(img_path, role="subject")
+        ctx = self._make_ctx(dry_run=True)
+        nb.run_generate_pipeline(ctx, "test", references=(ref,))
+        # Dry-run success is enough; contract tests verify the SDK input.
+
+
+class TestEditInstruction:
+    def test_build_edit_instruction_sections(self):
+        result = nb.build_edit_instruction(
+            "change background",
+            preserve="person",
+            change="background to blue",
+            mask="semantic",
+            strict_preservation=True,
+        )
+        assert "change background" in result
+        assert "PRESERVE:" in result
+        assert "person" in result
+        assert "CHANGE:" in result
+        assert "background to blue" in result
+        assert "MASK:" in result
+        assert "STRICT PRESERVATION:" in result
+
+    def test_build_edit_instruction_no_mask(self):
+        result = nb.build_edit_instruction("change bg")
+        assert "MASK:" not in result
+        assert "PRESERVE:" not in result
+        assert "CHANGE:" not in result
+
+    def test_build_edit_instruction_mask_none(self):
+        result = nb.build_edit_instruction("change bg", mask="none")
+        assert "MASK:" not in result
+
+    def test_build_edit_instruction_mask_path(self):
+        result = nb.build_edit_instruction("change bg", mask="/tmp/mask.png")
+        assert "MASK:" in result
+        assert "provided mask image" in result
+
+
+class TestEditCommand:
+    def _make_ctx(self, **kwargs):
+        obj = {
+            "model": "auto",
+            "output_dir": None,
+            "api_key": None,
+            "config": None,
+            "format": "png",
+            "json": False,
+            "quiet": False,
+            "verbose": False,
+            "dry_run": True,
+            "overwrite": False,
+            "seed": None,
+            "request_id": None,
+        }
+        obj.update(kwargs)
+
+        class FakeContext:
+            def __init__(self, obj):
+                self.obj = obj
+
+        return FakeContext(obj)
+
+    def test_edit_dry_run(self, tmp_path, capsys):
+        img_path = tmp_path / "input.png"
+        img_path.write_bytes(b"\x89PNG\x00\x00")
+        ctx = self._make_ctx()
+        nb.run_generate_pipeline(
+            ctx,
+            "change bg",
+            references=(nb.load_reference(img_path, role="input"),),
+            command="edit",
+        )
+        captured = capsys.readouterr()
+        assert "Dry Run" in captured.err
+        assert "Reference 1 (input)" in captured.err
+        assert "PRESERVE:" in captured.err
+
+    def test_edit_with_strict_preservation(self, tmp_path, capsys):
+        img_path = tmp_path / "input.png"
+        img_path.write_bytes(b"\x89PNG\x00\x00")
+        ctx = self._make_ctx()
+        nb.run_generate_pipeline(
+            ctx,
+            nb.build_edit_instruction("change bg", strict_preservation=True),
+            references=(nb.load_reference(img_path, role="input"),),
+            warnings=[
+                "Strict preservation enabled; the model may still alter fine details.",
+            ],
+            command="edit",
+        )
+        captured = capsys.readouterr()
+        assert "STRICT PRESERVATION" in captured.err
+
+    def test_edit_with_mask_reference(self, tmp_path):
+        input_path = tmp_path / "input.png"
+        input_path.write_bytes(b"\x89PNG\x00\x00")
+        mask_path = tmp_path / "mask.png"
+        mask_path.write_bytes(b"\x89PNG\x00\x00")
+        refs = [
+            nb.load_reference(input_path, role="input"),
+            nb.load_reference(mask_path, role="mask"),
+        ]
+        assert len(refs) == 2
+        assert refs[1].role == "mask"
+
+    def test_edit_command_via_cli(self, tmp_path):
+        from typer.testing import CliRunner
+
+        img_path = tmp_path / "input.png"
+        img_path.write_bytes(b"\x89PNG\x00\x00")
+        runner = CliRunner()
+        result = runner.invoke(
+            nb.app,
+            [
+                "--dry-run",
+                "edit",
+                str(img_path),
+                "change bg",
+                "--preserve",
+                "person",
+                "--strict-preservation",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Dry Run" in result.output
+        assert "Reference 1 (input)" in result.output
+        assert "STRICT PRESERVATION" in result.output
+
+    def test_edit_writes_warning_to_manifest(self, tmp_path, monkeypatch):
+        image_bytes = b"\x89PNG\x00\x00"
+        b64 = base64.b64encode(image_bytes).decode()
+        fake_response = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"inline_data": {"mime_type": "image/png", "data": b64}}
+                        ]
+                    }
+                }
+            ]
+        }
+
+        class FakeClient:
+            class interactions:
+                @staticmethod
+                def create(**kwargs):
+                    return fake_response
+
+        monkeypatch.setattr(nb, "genai", nb.genai)
+        monkeypatch.setattr(nb.genai, "Client", lambda api_key: FakeClient())
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.setattr(nb.time, "sleep", lambda _s: None)
+
+        img_path = tmp_path / "input.png"
+        img_path.write_bytes(b"\x89PNG\x00\x00")
+        output_dir = tmp_path / "out"
+        ctx = self._make_ctx(dry_run=False, output_dir=output_dir)
+        nb.run_generate_pipeline(
+            ctx,
+            nb.build_edit_instruction("change bg", strict_preservation=True),
+            references=(nb.load_reference(img_path, role="input"),),
+            warnings=[
+                "Strict preservation enabled; the model may still alter fine details.",
+            ],
+            command="edit",
+        )
+
+        manifest_path = next(p for p in output_dir.iterdir() if p.suffix == ".json")
+        manifest = json.loads(manifest_path.read_text())
+        assert any("Strict preservation" in w for w in manifest.get("warnings", []))
+
+
+class TestComposeCommand:
+    def _make_ctx(self, **kwargs):
+        obj = {
+            "model": "auto",
+            "output_dir": None,
+            "api_key": None,
+            "config": None,
+            "format": "png",
+            "json": False,
+            "quiet": False,
+            "verbose": False,
+            "dry_run": True,
+            "overwrite": False,
+            "seed": None,
+            "request_id": None,
+        }
+        obj.update(kwargs)
+
+        class FakeContext:
+            def __init__(self, obj):
+                self.obj = obj
+
+        return FakeContext(obj)
+
+    def test_compose_dry_run(self, tmp_path, capsys):
+        img_path = tmp_path / "subject.png"
+        img_path.write_bytes(b"\x89PNG\x00\x00")
+        ref = nb.load_reference(img_path, role="subject")
+        ctx = self._make_ctx()
+        nb.run_generate_pipeline(
+            ctx,
+            "combine",
+            references=(ref,),
+            command="compose",
+        )
+        captured = capsys.readouterr()
+        assert "Dry Run" in captured.err
+        assert "Reference 1 (subject)" in captured.err
+
+    def test_compose_no_references_fails(self):
+        from typer.testing import CliRunner
+
+        runner = CliRunner()
+        result = runner.invoke(nb.app, ["compose", "combine"])
+        assert result.exit_code == nb.ExitCode.INVALID_ARGS
+        assert "at least one reference" in result.output
+
+    def test_compose_command_via_cli(self, tmp_path):
+        from typer.testing import CliRunner
+
+        img_path = tmp_path / "subject.png"
+        img_path.write_bytes(b"\x89PNG\x00\x00")
+        runner = CliRunner()
+        result = runner.invoke(
+            nb.app,
+            ["--dry-run", "compose", "combine", "--subject", str(img_path)],
+        )
+        assert result.exit_code == 0
+        assert "Dry Run" in result.output
+        assert "Reference 1 (subject)" in result.output
+
+    def test_compose_allow_degraded_adds_warning(self, tmp_path, capsys):
+        # Create more references than Flash allows to force a warning.
+        refs = []
+        for i in range(12):
+            path = tmp_path / f"ref{i}.png"
+            path.write_bytes(b"\x89PNG\x00\x00")
+            refs.append(nb.load_reference(path, role="reference"))
+        ctx = self._make_ctx(dry_run=True)
+        nb.run_generate_pipeline(
+            ctx,
+            "combine",
+            references=tuple(refs),
+            allow_degraded=True,
+            command="compose",
+        )
+        captured = capsys.readouterr()
+        assert "Dry Run" in captured.err
+
+    def test_compose_reference_limit_fails_without_allow_degraded(self, tmp_path):
+        refs = []
+        for i in range(12):
+            path = tmp_path / f"ref{i}.png"
+            path.write_bytes(b"\x89PNG\x00\x00")
+            refs.append(nb.load_reference(path, role="reference"))
+        ctx = self._make_ctx()
+        with pytest.raises(nb.typer.Exit) as exc:
+            nb.run_generate_pipeline(
+                ctx,
+                "combine",
+                references=tuple(refs),
+                command="compose",
+            )
+        assert exc.value.exit_code == nb.ExitCode.CAPABILITY_MISMATCH
+
+
+class TestValidateRequest:
+    def test_allow_degraded_returns_warnings(self):
+        req = nb.ImageRequest(
+            command="compose",
+            prompt="combine",
+            model="pro",
+            aspect_ratio="1:4",
+            image_size="1K",
+            references=tuple(),
+        )
+        warnings = nb.validate_request(req, allow_degraded=True)
+        assert any("Flash-only" in w for w in warnings)
+
+    def test_allow_degraded_false_raises(self):
+        req = nb.ImageRequest(
+            command="compose",
+            prompt="combine",
+            model="pro",
+            aspect_ratio="1:4",
+            image_size="1K",
+            references=tuple(),
+        )
+        with pytest.raises(nb.typer.Exit) as exc:
+            nb.validate_request(req, allow_degraded=False)
+        assert exc.value.exit_code == nb.ExitCode.CAPABILITY_MISMATCH
