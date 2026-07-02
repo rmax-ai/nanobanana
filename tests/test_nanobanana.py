@@ -6,10 +6,9 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import conftest  # type: ignore[import]
 import pytest
 import typer
-
-import conftest  # type: ignore[import]
 from conftest import (  # type: ignore[import]
     COST_TABLE,
     ExitCode,
@@ -47,7 +46,6 @@ from conftest import (  # type: ignore[import]
     write_manifest,
 )
 
-
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -57,11 +55,7 @@ def make_image_response(image_data: bytes) -> dict:
     b64 = base64.b64encode(image_data).decode("ascii")
     return {
         "candidates": [
-            {
-                "content": {
-                    "parts": [{"inline_data": {"mime_type": "image/png", "data": b64}}]
-                }
-            }
+            {"content": {"parts": [{"inline_data": {"mime_type": "image/png", "data": b64}}]}}
         ]
     }
 
@@ -117,9 +111,7 @@ class TestModelSelection:
         assert decision.resolved == "gemini-3.1-flash-lite-image"
 
     def test_auto_diagram_to_pro(self):
-        request = ImageRequest(
-            command="diagram", prompt="a system diagram", model="auto"
-        )
+        request = ImageRequest(command="diagram", prompt="a system diagram", model="auto")
         decision = select_model(request)
         assert decision.resolved == "gemini-3-pro-image"
 
@@ -203,17 +195,13 @@ class TestModelSelection:
 
 class TestValidation:
     def test_lite_rejects_4k(self):
-        request = ImageRequest(
-            command="generate", prompt="x", model="lite", image_size="4K"
-        )
+        request = ImageRequest(command="generate", prompt="x", model="lite", image_size="4K")
         with pytest.raises(typer.Exit) as exc:
             validate_request(request)
         assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
 
     def test_flash_allows_2k(self):
-        request = ImageRequest(
-            command="generate", prompt="x", model="flash", image_size="2K"
-        )
+        request = ImageRequest(command="generate", prompt="x", model="flash", image_size="2K")
         assert validate_request(request) == []
 
     def test_lite_rejects_grounding(self):
@@ -229,9 +217,7 @@ class TestValidation:
         assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
 
     def test_invalid_aspect_ratio(self):
-        request = ImageRequest(
-            command="generate", prompt="x", model="flash", aspect_ratio="99:1"
-        )
+        request = ImageRequest(command="generate", prompt="x", model="flash", aspect_ratio="99:1")
         with pytest.raises(typer.Exit) as exc:
             validate_request(request)
         assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
@@ -258,9 +244,7 @@ class TestValidation:
             )
             for _ in range(12)
         )
-        request = ImageRequest(
-            command="generate", prompt="x", model="flash", references=refs
-        )
+        request = ImageRequest(command="generate", prompt="x", model="flash", references=refs)
         with pytest.raises(typer.Exit) as exc:
             validate_request(request)
         assert exc.value.exit_code == ExitCode.CAPABILITY_MISMATCH
@@ -275,9 +259,7 @@ class TestValidation:
             )
             for _ in range(12)
         )
-        request = ImageRequest(
-            command="generate", prompt="x", model="flash", references=refs
-        )
+        request = ImageRequest(command="generate", prompt="x", model="flash", references=refs)
         warnings = validate_request(request, allow_degraded=True)
         assert len(warnings) == 1
         assert "exceed" in warnings[0]
@@ -336,12 +318,8 @@ class TestPromptAssembly:
         assert "Generic or off-brand" in prompt
 
     def test_references_in_prompt(self):
-        ref = ReferenceImage(
-            path=Path("x.png"), role="style", mime_type="image/png", sha256="abc"
-        )
-        request = ImageRequest(
-            command="compose", prompt="blend", model="auto", references=(ref,)
-        )
+        ref = ReferenceImage(path=Path("x.png"), role="style", mime_type="image/png", sha256="abc")
+        request = ImageRequest(command="compose", prompt="blend", model="auto", references=(ref,))
         prompt = build_normalized_prompt(request)
         assert "REFERENCE ROLES:" in prompt
         assert "Reference 1 (style)" in prompt
@@ -359,9 +337,7 @@ class TestPromptAssembly:
         assert expand_negative("   ") == ""
 
     def test_output_intent_with_text(self):
-        request = ImageRequest(
-            command="generate", prompt="x", model="auto", text_output=True
-        )
+        request = ImageRequest(command="generate", prompt="x", model="auto", text_output=True)
         prompt = build_normalized_prompt(request)
         assert "text explanation" in prompt
 
@@ -445,12 +421,8 @@ class TestManifest:
             resolved="gemini-3.1-flash-image",
             selection_reason="explicit",
         )
-        asset = GeneratedAsset(
-            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
-        )
-        manifest_path = write_manifest(
-            request, decision, "normalized", [asset], temp_dir
-        )
+        asset = GeneratedAsset(path=temp_dir / "out.png", mime_type="image/png", sha256="abc")
+        manifest_path = write_manifest(request, decision, "normalized", [asset], temp_dir)
         data = json.loads(manifest_path.read_text())
         assert data["schema_version"] == "1.0"
         assert data["run_id"] == request.request_id
@@ -465,9 +437,7 @@ class TestManifest:
             resolved="gemini-3.1-flash-image",
             selection_reason="explicit",
         )
-        asset = GeneratedAsset(
-            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
-        )
+        asset = GeneratedAsset(path=temp_dir / "out.png", mime_type="image/png", sha256="abc")
         manifest_path = write_manifest(request, decision, "norm", [asset], temp_dir)
         data = json.loads(manifest_path.read_text())
         assert data["schema_version"] == "1.0"
@@ -479,9 +449,7 @@ class TestManifest:
             resolved="gemini-3.1-flash-image",
             selection_reason="explicit",
         )
-        asset = GeneratedAsset(
-            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
-        )
+        asset = GeneratedAsset(path=temp_dir / "out.png", mime_type="image/png", sha256="abc")
         manifest_path = write_manifest(
             request, decision, "norm", [asset], temp_dir, warnings=["warn1"]
         )
@@ -495,9 +463,7 @@ class TestManifest:
             resolved="gemini-3.1-flash-image",
             selection_reason="explicit",
         )
-        asset = GeneratedAsset(
-            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
-        )
+        asset = GeneratedAsset(path=temp_dir / "out.png", mime_type="image/png", sha256="abc")
         grounding = {"sources": ["https://example.com"]}
         manifest_path = write_manifest(
             request,
@@ -628,15 +594,10 @@ class TestRetry:
 
 class TestCost:
     def test_flash_2k(self):
-        assert (
-            estimate_cost("flash", "2K") == COST_TABLE["gemini-3.1-flash-image"]["2K"]
-        )
+        assert estimate_cost("flash", "2K") == COST_TABLE["gemini-3.1-flash-image"]["2K"]
 
     def test_lite_1k(self):
-        assert (
-            estimate_cost("lite", "1K")
-            == COST_TABLE["gemini-3.1-flash-lite-image"]["1K"]
-        )
+        assert estimate_cost("lite", "1K") == COST_TABLE["gemini-3.1-flash-lite-image"]["1K"]
 
     def test_unknown_size(self):
         assert estimate_cost("flash", "8K") is None
@@ -658,9 +619,7 @@ class TestSecretRedaction:
             resolved="gemini-3.1-flash-image",
             selection_reason="explicit",
         )
-        asset = GeneratedAsset(
-            path=temp_dir / "out.png", mime_type="image/png", sha256="abc"
-        )
+        asset = GeneratedAsset(path=temp_dir / "out.png", mime_type="image/png", sha256="abc")
         manifest_path = write_manifest(request, decision, "norm", [asset], temp_dir)
         text = manifest_path.read_text()
         assert "secret-key-123" not in text
@@ -668,8 +627,8 @@ class TestSecretRedaction:
     def test_key_not_in_log(self, temp_dir, monkeypatch, capsys, mock_client):
         monkeypatch.setenv("GEMINI_API_KEY", "secret-key-123")
         image_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
-        mock_client.Client.return_value.interactions.create.return_value = (
-            make_image_response(image_data)
+        mock_client.Client.return_value.interactions.create.return_value = make_image_response(
+            image_data
         )
         monkeypatch.setattr(time, "sleep", lambda _s: None)
 
@@ -745,8 +704,8 @@ class TestExtractGroundingMetadata:
 class TestContract:
     def test_successful_response(self, temp_dir, monkeypatch, mock_client):
         image_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
-        mock_client.Client.return_value.interactions.create.return_value = (
-            make_image_response(image_data)
+        mock_client.Client.return_value.interactions.create.return_value = make_image_response(
+            image_data
         )
         monkeypatch.setattr(time, "sleep", lambda _s: None)
 
@@ -779,9 +738,7 @@ class TestContract:
         class AuthError(Exception):
             code = "401"
 
-        mock_client.Client.return_value.interactions.create.side_effect = AuthError(
-            "unauthorized"
-        )
+        mock_client.Client.return_value.interactions.create.side_effect = AuthError("unauthorized")
         monkeypatch.setattr(time, "sleep", lambda _s: None)
 
         with pytest.raises(typer.Exit) as exc:

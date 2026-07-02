@@ -1,30 +1,66 @@
+# Make 'import conftest' work in test modules.
 import sys
-import types
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+from nanobanana.cli import app  # noqa: F401
+from nanobanana.client import (  # noqa: F401
+    build_interaction_input,
+    classify_api_exception,
+    execute_request,
+    is_retryable,
+    is_safety_refusal,
+    with_retry,
+)
 
-nanobanana_mod = types.ModuleType("nanobanana")
-# Register the module before exec so dataclass string-annotation evaluation can
-# resolve forward references against the module namespace.
-sys.modules["nanobanana"] = nanobanana_mod
-source = Path(PROJECT_ROOT, "nanobanana").read_text()
-exec(source.split("if __name__")[0], nanobanana_mod.__dict__)
+# Re-export everything the test file imports.
+from nanobanana.constants import (  # noqa: F401
+    CAPABILITIES,
+    COST_TABLE,
+    PRESETS,
+    ExitCode,
+)
+from nanobanana.model_selection import (  # noqa: F401
+    _should_use_lite,
+    _should_use_pro,
+    estimate_cost,
+    get_capability,
+    resolve_model_alias,
+    select_model,
+    supports,
+    validate_request,
+)
+from nanobanana.output import (  # noqa: F401
+    atomic_write,
+    generate_filename,
+    resolve_output_path,
+    write_manifest,
+)
+from nanobanana.pipeline import run_generate_pipeline  # noqa: F401
+from nanobanana.prompt import (  # noqa: F401
+    annotate_references,
+    build_edit_instruction,
+    build_normalized_prompt,
+    expand_negative,
+)
+from nanobanana.response import (  # noqa: F401
+    extract_grounding_metadata,
+)
+from nanobanana.types import (  # noqa: F401
+    GeneratedAsset,
+    ImageRequest,
+    ModelDecision,
+    ReferenceImage,
+)
+from nanobanana.utils import (  # noqa: F401
+    detect_mime_type,
+    load_reference,
+    sha256_bytes,
+    sha256_file,
+    slugify,
+)
 
-# Expose all public names and single-underscore helpers used by tests at module level.
-for name in dir(nanobanana_mod):
-    if not name.startswith("__"):
-        globals()[name] = getattr(nanobanana_mod, name)
-
-# Bind names used by fixtures so static linters can resolve them.
-ImageRequest = nanobanana_mod.ImageRequest
-load_reference = nanobanana_mod.load_reference
-
-# Make the conftest module importable as `conftest` from test modules.
 sys.modules.setdefault("conftest", sys.modules[__name__])
 
 
@@ -35,11 +71,7 @@ def temp_dir(tmp_path):
 
 @pytest.fixture
 def sample_request():
-    return ImageRequest(
-        command="generate",
-        prompt="a red banana",
-        model="auto",
-    )
+    return ImageRequest(command="generate", prompt="a red banana", model="auto")
 
 
 @pytest.fixture
@@ -49,15 +81,13 @@ def sample_reference(temp_dir):
     return load_reference(path, role="style")
 
 
-class MockGenai:
-    def __init__(self):
-        self.Client = MagicMock()
-
-
 @pytest.fixture
 def mock_client(monkeypatch):
-    mock_genai = MockGenai()
-    # Functions in the execed nanobanana module look up `genai` in their own
-    # module namespace, so patch that rather than the conftest namespace.
-    monkeypatch.setattr(sys.modules["nanobanana"], "genai", mock_genai)
-    return mock_genai
+    """Mock google.genai.Client for contract tests."""
+    mock_client_instance = MagicMock()
+    mock_genai_module = MagicMock()
+    mock_genai_module.Client = MagicMock(return_value=mock_client_instance)
+    # Patch genai in both modules that import it.
+    monkeypatch.setattr("nanobanana.client.genai", mock_genai_module)
+    monkeypatch.setattr("nanobanana.pipeline.genai", mock_genai_module)
+    return mock_genai_module

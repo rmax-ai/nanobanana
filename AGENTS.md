@@ -6,30 +6,28 @@ This document captures the conventions that all contributors and AI coding agent
 
 ## 1. Project DNA
 
-- **Single-file distribution.** All code lives in `nanobanana` until it exceeds ~1,500-2,000 lines.
-- **uv script.** PEP 723 inline metadata for dependencies. No `pyproject.toml`, no `setup.py`, no virtualenv management.
+- **Package distribution via pyproject.toml + uv.** Thin PEP 723 wrapper for single-file compat.
+- **pyproject.toml with uv.** Thin PEP 723 wrapper available.
+- **uv-managed virtualenv via pyproject.toml.**
 - **Task-oriented CLI.** Commands encode use cases (generate, edit, compose), not API parameters.
 - **Model selection is policy-driven.** Never scatter model-specific conditionals across command handlers.
 - **Every run is auditable.** Output includes a manifest with SHA-256, model decision rationale, and normalized prompt.
 
 ## 2. Code Organisation
 
-```python
-# Layer order within the single file:
-# 1. Shebang + PEP 723 metadata
-# 2. Imports
-# 3. Type definitions (ImageRequest, ReferenceImage, GeneratedAsset, ModelDecision)
-# 4. Capability registry (model capabilities, limits, validation)
-# 5. Preset definitions (PRESETS dict)
-# 6. Model selection engine (select_model function)
-# 7. Prompt assembly (build_normalized_prompt function)
-# 8. Request construction (build_interaction_input function)
-# 9. Retry/rate-limit handler
-# 10. Response extraction (extract_images, extract_grounding_metadata)
-# 11. Image writing (atomic write, SHA-256, filename generation)
-# 12. Manifest serialization
-# 13. CLI commands (Typer app + command functions)
-# 14. main() entry point
+```
+src/nanobanana/
+├── __init__.py          — Package marker
+├── types.py             — Frozen dataclasses (ImageRequest, ReferenceImage, GeneratedAsset, ModelDecision)
+├── constants.py         — Exit codes, capabilities, presets, cost table, aspect ratios
+├── utils.py             — Filesystem, hashing, config, MIME detection, reference loading
+├── model_selection.py   — Model resolution, auto selection policy, capability validation
+├── prompt.py            — Structured prompt assembly, edit instruction builder
+├── client.py            — Gemini API request construction, retry, error classification
+├── response.py          — Image extraction, grounding metadata, response error detection
+├── output.py            — Atomic file I/O, manifest serialization, dry-run display
+├── pipeline.py          — run_generate_pipeline orchestration (prompt → API → output)
+└── cli.py               — Typer app, global options, 11 commands
 ```
 
 - Import order: stdlib → third-party → google-genai

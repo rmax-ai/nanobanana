@@ -1,6 +1,6 @@
 # nanobanana
 
-Single-file Gemini Image CLI. One executable Python script. No venv management.
+Package-managed Gemini Image CLI. Also runnable as a single-file script.
 
 ## Quickstart
 
@@ -15,6 +15,21 @@ uv run --script ./nanobanana generate "A brutalist library in the Andes mountain
 chmod +x nanobanana
 cp nanobanana ~/.local/bin/
 nanobanana generate "A brutalist library in the Andes mountains at sunset"
+```
+
+## Install as Package
+
+```bash
+git clone https://github.com/rmax-ai/nanobanana.git
+cd nanobanana
+uv sync
+uv run nanobanana generate "test"
+```
+
+Or install globally:
+
+```bash
+uv tool install git+https://github.com/rmax-ai/nanobanana.git
 ```
 
 ## What it does
@@ -105,7 +120,7 @@ Every run produces:
 - [uv](https://docs.astral.sh/uv/) (for dependency management)
 - A [Gemini API key](https://aistudio.google.com/apikey)
 
-No virtualenv. No pip install. No pyproject.toml. Just one file.
+Package-managed with uv. Also available as a single-file script.
 
 ## Documentation
 
