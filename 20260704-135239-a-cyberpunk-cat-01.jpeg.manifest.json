@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "run_id": "dfe0437a-ad1c-4a61-8803-91aaf992282a",
+  "created_at": "2026-07-04T13:52:39.218560+00:00",
+  "command": "generate",
+  "model": {
+    "requested": "flash",
+    "resolved": "gemini-3.1-flash-image",
+    "selection_reason": "explicitly requested model"
+  },
+  "input": {
+    "prompt": "A cyberpunk cat sitting on a neon-lit Tokyo rooftop at night, rain-slicked surfaces, cinematic lighting",
+    "references": []
+  },
+  "response_format": {
+    "mime_type": "image/jpeg",
+    "text_output": false
+  },
+  "generation": {
+    "normalized_prompt": "TASK:\nA cyberpunk cat sitting on a neon-lit Tokyo rooftop at night, rain-slicked surfaces, cinematic lighting\n\nREQUIREMENTS:\n- Aspect ratio: 16:9\n- Image size: 1K\n- Quality: balanced\n- Output format: image/jpeg\n\nAVOID:\n- Illegible labels or text\n- Generic or off-brand visual clich\u00e9s\n\nOUTPUT INTENT:\nProduce a single, self-contained image that fulfills the task and requirements.",
+    "aspect_ratio": "16:9",
+    "image_size": "1K",
+    "quality": "balanced",
+    "thinking_level": "auto",
+    "grounding": null,
+    "seed": null,
+    "count": 1,
+    "preset": null
+  },
+  "outputs": [
+    {
+      "path": "/home/rmax-10/src/nanobanana/20260704-135239-a-cyberpunk-cat-01.jpeg",
+      "mime_type": "image/jpeg",
+      "sha256": "e16b67410a86676b7ffa5fba5864801cfec058b09eb382012f70f00e19c20bcc"
+    }
+  ],
+  "usage": {
+    "estimated_cost_usd": 0.067,
+    "image_count": 1
+  }
+}

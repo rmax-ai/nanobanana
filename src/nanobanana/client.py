@@ -24,30 +24,41 @@ def build_interaction_input(
     normalized_prompt: str,
     decision: ModelDecision,
 ) -> dict:
-    """Build kwargs for client.interactions.create."""
-    input_data: dict[str, Any] = {
-        "model": decision.resolved,
-        "contents": [{"role": "user", "parts": [{"text": normalized_prompt}]}],
-    }
+    """Build kwargs for client.interactions.create (google-genai >=2.0.0 API)."""
+    # Build input parts — text first, then reference images
+    parts: list[dict[str, Any]] = [{"type": "text", "text": normalized_prompt}]
 
     if request.references:
-        parts: list[dict[str, Any]] = [{"text": normalized_prompt}]
         for ref in request.references:
             image_bytes = ref.path.read_bytes()
             b64 = base64.b64encode(image_bytes).decode("ascii")
-            parts.append({"inline_data": {"mime_type": ref.mime_type, "data": b64}})
-        input_data["contents"] = [{"role": "user", "parts": parts}]
+            parts.append({
+                "type": "image",
+                "data": b64,
+                "mime_type": ref.mime_type,
+            })
 
+    input_data: dict[str, Any] = {
+        "model": decision.resolved,
+        "input": parts if len(parts) > 1 else parts[0]["text"],
+    }
+
+    # Build new-style response_format
     if request.text_output:
         input_data["response_format"] = [
             {"type": "text"},
-            {"type": request.mime_type},
+            {"type": "image", "mime_type": request.mime_type},
         ]
     else:
-        input_data["response_format"] = {"type": request.mime_type}
+        rf: dict[str, Any] = {"type": "image", "mime_type": request.mime_type}
+        if request.aspect_ratio:
+            rf["aspect_ratio"] = request.aspect_ratio
+        if request.image_size:
+            rf["image_size"] = request.image_size
+        input_data["response_format"] = rf
 
     if request.grounding:
-        input_data["tools"] = [{"type": "google_search"}]
+        input_data["tools"] = [{"google_search": {}}]
 
     generation_config: dict[str, Any] = {}
     if request.thinking_level and request.thinking_level != "auto":
@@ -137,18 +148,18 @@ def classify_api_exception(exc: Exception) -> int:
 
 
 def is_safety_refusal(response: object) -> bool:
-    """Check finish_reason and prompt feedback for safety blocks."""
+    """Check steps and status for safety blocks in v2 API."""
     if response is None:
         return False
-    candidates = _get(response, "candidates", []) or []
-    for candidate in candidates:
-        finish = _get(candidate, "finish_reason")
+    # Check interaction status
+    status = _get(response, "status")
+    if status is not None and str(status).upper() in {"SAFETY", "BLOCKED"}:
+        return True
+    # Check steps for safety-related finish reasons
+    steps = _get(response, "steps", []) or []
+    for step in steps:
+        finish = _get(step, "finish_reason")
         if finish is not None and str(finish).upper() in {"SAFETY", "BLOCKED"}:
-            return True
-    prompt_feedback = _get(response, "prompt_feedback")
-    if prompt_feedback is not None:
-        block = _get(prompt_feedback, "block_reason", "")
-        if block and "safety" in str(block).lower():
             return True
     return False
 

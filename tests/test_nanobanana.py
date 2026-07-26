@@ -47,16 +47,22 @@ from conftest import (  # type: ignore[import]
 )
 
 # =============================================================================
-# Helpers
+# Helpers (v2 SDK format)
 # =============================================================================
 
 
 def make_image_response(image_data: bytes) -> dict:
     b64 = base64.b64encode(image_data).decode("ascii")
     return {
-        "candidates": [
-            {"content": {"parts": [{"inline_data": {"mime_type": "image/png", "data": b64}}]}}
-        ]
+        "output_image": {"data": b64, "mime_type": "image/png"},
+        "steps": [
+            {
+                "type": "model_output",
+                "content": [
+                    {"type": "image", "data": b64, "mime_type": "image/png"}
+                ],
+            }
+        ],
     }
 
 
@@ -527,11 +533,11 @@ class TestRetry:
         assert is_retryable(Exc("unauthorized")) is False
 
     def test_safety_refusal_check(self):
-        response = {"candidates": [{"finish_reason": "SAFETY"}]}
+        response = {"status": "SAFETY"}
         assert is_safety_refusal(response) is True
 
     def test_safety_refusal_prompt_feedback(self):
-        response = {"prompt_feedback": {"block_reason": "safety"}}
+        response = {"steps": [{"finish_reason": "SAFETY"}]}
         assert is_safety_refusal(response) is True
 
     def test_with_retry_success_after_transient(self, monkeypatch):
@@ -675,13 +681,14 @@ class TestBuildEditInstruction:
 class TestExtractGroundingMetadata:
     def test_extracts_sources(self):
         response = {
-            "candidates": [
+            "steps": [
                 {
+                    "type": "model_output",
                     "grounding_metadata": {
                         "sources": ["https://example.com"],
                         "citations": ["claim"],
                         "suggestions": ["search"],
-                    }
+                    },
                 }
             ]
         }
@@ -693,7 +700,7 @@ class TestExtractGroundingMetadata:
         }
 
     def test_empty_returns_none(self):
-        assert extract_grounding_metadata({"candidates": []}) is None
+        assert extract_grounding_metadata({"steps": []}) is None
 
 
 # =============================================================================
@@ -721,7 +728,8 @@ class TestContract:
 
     def test_safety_refusal(self, temp_dir, monkeypatch, mock_client):
         mock_client.Client.return_value.interactions.create.return_value = {
-            "candidates": [{"finish_reason": "SAFETY"}]
+            "status": "SAFETY",
+            "steps": [],
         }
         monkeypatch.setattr(time, "sleep", lambda _s: None)
 
@@ -752,7 +760,7 @@ class TestContract:
 
     def test_empty_response(self, temp_dir, monkeypatch, mock_client):
         mock_client.Client.return_value.interactions.create.return_value = {
-            "candidates": [{"content": {"parts": []}}]
+            "steps": [],
         }
         monkeypatch.setattr(time, "sleep", lambda _s: None)
 
@@ -808,7 +816,7 @@ class TestContract:
         )
         assert input_data["response_format"] == [
             {"type": "text"},
-            {"type": "image/png"},
+            {"type": "image", "mime_type": "image/png"},
         ]
 
 
